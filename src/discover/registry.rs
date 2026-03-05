@@ -1131,4 +1131,461 @@ mod tests {
             Some("rtk docker run --rm ubuntu bash".into())
         );
     }
+
+    // --- AWS / psql (PR #216) ---
+
+    #[test]
+    fn test_classify_aws() {
+        assert!(matches!(
+            classify_command("aws s3 ls"),
+            Classification::Supported {
+                rtk_equivalent: "rtk aws",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_aws_ec2() {
+        assert!(matches!(
+            classify_command("aws ec2 describe-instances"),
+            Classification::Supported {
+                rtk_equivalent: "rtk aws",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_psql() {
+        assert!(matches!(
+            classify_command("psql -U postgres"),
+            Classification::Supported {
+                rtk_equivalent: "rtk psql",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_psql_url() {
+        assert!(matches!(
+            classify_command("psql postgres://localhost/mydb"),
+            Classification::Supported {
+                rtk_equivalent: "rtk psql",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_aws() {
+        assert_eq!(rewrite_command("aws s3 ls"), Some("rtk aws s3 ls".into()));
+    }
+
+    #[test]
+    fn test_rewrite_aws_ec2() {
+        assert_eq!(
+            rewrite_command("aws ec2 describe-instances --region us-east-1"),
+            Some("rtk aws ec2 describe-instances --region us-east-1".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_psql() {
+        assert_eq!(
+            rewrite_command("psql -U postgres -d mydb"),
+            Some("rtk psql -U postgres -d mydb".into())
+        );
+    }
+
+    // --- Python tooling ---
+
+    #[test]
+    fn test_classify_ruff_check() {
+        assert!(matches!(
+            classify_command("ruff check ."),
+            Classification::Supported {
+                rtk_equivalent: "rtk ruff",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_ruff_format() {
+        assert!(matches!(
+            classify_command("ruff format src/"),
+            Classification::Supported {
+                rtk_equivalent: "rtk ruff",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_pytest() {
+        assert!(matches!(
+            classify_command("pytest tests/"),
+            Classification::Supported {
+                rtk_equivalent: "rtk pytest",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_python_m_pytest() {
+        assert!(matches!(
+            classify_command("python -m pytest tests/"),
+            Classification::Supported {
+                rtk_equivalent: "rtk pytest",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_pip_list() {
+        assert!(matches!(
+            classify_command("pip list"),
+            Classification::Supported {
+                rtk_equivalent: "rtk pip",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_uv_pip_list() {
+        assert!(matches!(
+            classify_command("uv pip list"),
+            Classification::Supported {
+                rtk_equivalent: "rtk pip",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_ruff_check() {
+        assert_eq!(
+            rewrite_command("ruff check ."),
+            Some("rtk ruff check .".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_ruff_format() {
+        assert_eq!(
+            rewrite_command("ruff format src/"),
+            Some("rtk ruff format src/".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pytest() {
+        assert_eq!(
+            rewrite_command("pytest tests/"),
+            Some("rtk pytest tests/".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_python_m_pytest() {
+        assert_eq!(
+            rewrite_command("python -m pytest -x tests/"),
+            Some("rtk pytest -x tests/".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pip_list() {
+        assert_eq!(rewrite_command("pip list"), Some("rtk pip list".into()));
+    }
+
+    #[test]
+    fn test_rewrite_pip_outdated() {
+        assert_eq!(
+            rewrite_command("pip outdated"),
+            Some("rtk pip outdated".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_uv_pip_list() {
+        assert_eq!(rewrite_command("uv pip list"), Some("rtk pip list".into()));
+    }
+
+    // --- Go tooling ---
+
+    #[test]
+    fn test_classify_go_test() {
+        assert!(matches!(
+            classify_command("go test ./..."),
+            Classification::Supported {
+                rtk_equivalent: "rtk go",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_go_build() {
+        assert!(matches!(
+            classify_command("go build ./..."),
+            Classification::Supported {
+                rtk_equivalent: "rtk go",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_go_vet() {
+        assert!(matches!(
+            classify_command("go vet ./..."),
+            Classification::Supported {
+                rtk_equivalent: "rtk go",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_golangci_lint() {
+        assert!(matches!(
+            classify_command("golangci-lint run"),
+            Classification::Supported {
+                rtk_equivalent: "rtk golangci-lint",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_go_test() {
+        assert_eq!(
+            rewrite_command("go test ./..."),
+            Some("rtk go test ./...".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_go_build() {
+        assert_eq!(
+            rewrite_command("go build ./..."),
+            Some("rtk go build ./...".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_go_vet() {
+        assert_eq!(
+            rewrite_command("go vet ./..."),
+            Some("rtk go vet ./...".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_golangci_lint() {
+        assert_eq!(
+            rewrite_command("golangci-lint run ./..."),
+            Some("rtk golangci-lint run ./...".into())
+        );
+    }
+
+    // --- JS/TS tooling ---
+
+    #[test]
+    fn test_classify_vitest() {
+        assert!(matches!(
+            classify_command("vitest run"),
+            Classification::Supported {
+                rtk_equivalent: "rtk vitest",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_vitest() {
+        assert_eq!(rewrite_command("vitest run"), Some("rtk vitest run".into()));
+    }
+
+    #[test]
+    fn test_rewrite_pnpm_vitest() {
+        assert_eq!(
+            rewrite_command("pnpm vitest run"),
+            Some("rtk vitest run".into())
+        );
+    }
+
+    #[test]
+    fn test_classify_prisma() {
+        assert!(matches!(
+            classify_command("npx prisma migrate dev"),
+            Classification::Supported {
+                rtk_equivalent: "rtk prisma",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_prisma() {
+        assert_eq!(
+            rewrite_command("npx prisma migrate dev"),
+            Some("rtk prisma migrate dev".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_prettier() {
+        assert_eq!(
+            rewrite_command("npx prettier --check src/"),
+            Some("rtk prettier --check src/".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pnpm_list() {
+        assert_eq!(rewrite_command("pnpm list"), Some("rtk pnpm list".into()));
+    }
+
+    // --- Compound operator edge cases ---
+
+    #[test]
+    fn test_rewrite_compound_or() {
+        // `||` fallback: left rewritten, right rewritten
+        assert_eq!(
+            rewrite_command("cargo test || cargo build"),
+            Some("rtk cargo test || rtk cargo build".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_compound_semicolon() {
+        assert_eq!(
+            rewrite_command("git status; cargo test"),
+            Some("rtk git status; rtk cargo test".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_compound_pipe_raw_filter() {
+        // Pipe: rewrite first segment only, pass through rest unchanged
+        assert_eq!(
+            rewrite_command("cargo test | grep FAILED"),
+            Some("rtk cargo test | grep FAILED".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_compound_pipe_git_grep() {
+        assert_eq!(
+            rewrite_command("git log -10 | grep feat"),
+            Some("rtk git log -10 | grep feat".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_compound_four_segments() {
+        assert_eq!(
+            rewrite_command("cargo fmt --all && cargo clippy && cargo test && git status"),
+            Some(
+                "rtk cargo fmt --all && rtk cargo clippy && rtk cargo test && rtk git status"
+                    .into()
+            )
+        );
+    }
+
+    #[test]
+    fn test_rewrite_compound_mixed_supported_unsupported() {
+        // unsupported segments stay raw
+        assert_eq!(
+            rewrite_command("cargo test && terraform plan"),
+            Some("rtk cargo test && terraform plan".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_compound_all_unsupported_returns_none() {
+        // No rewrite at all: returns None
+        assert_eq!(rewrite_command("terraform plan && terraform apply"), None);
+    }
+
+    // --- sudo / env prefix + rewrite ---
+
+    #[test]
+    fn test_rewrite_sudo_docker() {
+        assert_eq!(
+            rewrite_command("sudo docker ps"),
+            Some("sudo rtk docker ps".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_env_var_prefix() {
+        assert_eq!(
+            rewrite_command("GIT_SSH_COMMAND=ssh git push origin main"),
+            Some("GIT_SSH_COMMAND=ssh rtk git push origin main".into())
+        );
+    }
+
+    // --- find with native flags ---
+
+    #[test]
+    fn test_rewrite_find_with_flags() {
+        assert_eq!(
+            rewrite_command("find . -name '*.rs' -type f"),
+            Some("rtk find . -name '*.rs' -type f".into())
+        );
+    }
+
+    // --- Ensure PATTERNS and RULES stay aligned after modifications ---
+
+    #[test]
+    fn test_patterns_rules_aligned_after_aws_psql() {
+        // If this fails, someone added a PATTERN without a matching RULE (or vice versa)
+        assert_eq!(
+            PATTERNS.len(),
+            RULES.len(),
+            "PATTERNS[{}] != RULES[{}] — they must stay 1:1",
+            PATTERNS.len(),
+            RULES.len()
+        );
+    }
+
+    // --- All RULES have non-empty rtk_cmd and at least one rewrite_prefix ---
+
+    #[test]
+    fn test_all_rules_have_valid_rtk_cmd() {
+        for rule in RULES {
+            assert!(!rule.rtk_cmd.is_empty(), "Rule with empty rtk_cmd found");
+            assert!(
+                rule.rtk_cmd.starts_with("rtk "),
+                "rtk_cmd '{}' must start with 'rtk '",
+                rule.rtk_cmd
+            );
+            assert!(
+                !rule.rewrite_prefixes.is_empty(),
+                "Rule '{}' has no rewrite_prefixes",
+                rule.rtk_cmd
+            );
+        }
+    }
+
+    // --- Every PATTERN compiles to a valid Regex ---
+
+    #[test]
+    fn test_all_patterns_are_valid_regex() {
+        use regex::Regex;
+        for (i, pattern) in PATTERNS.iter().enumerate() {
+            assert!(
+                Regex::new(pattern).is_ok(),
+                "PATTERNS[{i}] = '{pattern}' is not a valid regex"
+            );
+        }
+    }
 }
