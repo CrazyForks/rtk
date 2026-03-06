@@ -289,11 +289,10 @@ fn view_pr(args: &[String], _verbose: u8, ultra_compact: bool) -> Result<()> {
         None => return Err(anyhow::anyhow!("PR number required")),
     };
 
-    // If the user provides --json, --jq, or --web, pass through directly.
-    // Our filter forces its own --json fields and would ignore user-requested fields.
-    let extra_args = &args[1..];
-    if should_passthrough_pr_view(extra_args) {
-        return run_passthrough_with_extra("gh", &["pr", "view", pr_number.as_str()], extra_args);
+    // If the user provides --jq or --web, pass through directly.
+    // Note: --json is already handled globally by run() via has_json_flag.
+    if should_passthrough_pr_view(&extra_args) {
+        return run_passthrough_with_extra("gh", &["pr", "view", &pr_number], &extra_args);
     }
 
     let mut cmd = Command::new("gh");
