@@ -184,8 +184,9 @@ fn docker_logs(args: &[String], _verbose: u8) -> Result<()> {
     let raw = format!("{}\n{}", stdout, stderr);
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprint!("{}", stderr);
+        if !stderr.trim().is_empty() {
+            eprint!("{}", stderr);
+        }
         timer.track(
             &format!("docker logs {}", container),
             "rtk docker logs",
@@ -222,7 +223,9 @@ fn kubectl_pods(args: &[String], _verbose: u8) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprint!("{}", stderr);
+        if !stderr.trim().is_empty() {
+            eprint!("{}", stderr);
+        }
         timer.track("kubectl get pods", "rtk kubectl pods", &raw, &raw);
         std::process::exit(output.status.code().unwrap_or(1));
     }
@@ -327,7 +330,9 @@ fn kubectl_services(args: &[String], _verbose: u8) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprint!("{}", stderr);
+        if !stderr.trim().is_empty() {
+            eprint!("{}", stderr);
+        }
         timer.track("kubectl get svc", "rtk kubectl svc", &raw, &raw);
         std::process::exit(output.status.code().unwrap_or(1));
     }
@@ -410,7 +415,9 @@ fn kubectl_logs(args: &[String], _verbose: u8) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprint!("{}", stderr);
+        if !stderr.trim().is_empty() {
+            eprint!("{}", stderr);
+        }
         timer.track(
             &format!("kubectl logs {}", pod),
             "rtk kubectl logs",

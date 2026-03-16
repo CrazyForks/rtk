@@ -251,10 +251,12 @@ impl Tracker {
         }
 
         let conn = Connection::open(&db_path)?;
-        conn.execute_batch(
+        // WAL mode + busy_timeout for concurrent access (multiple Claude Code instances).
+        // Non-fatal: NFS/read-only filesystems may not support WAL.
+        let _ = conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA busy_timeout=5000;",
-        )?;
+        );
         conn.execute(
             "CREATE TABLE IF NOT EXISTS commands (
                 id INTEGER PRIMARY KEY,
