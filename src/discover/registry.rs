@@ -66,7 +66,11 @@ static ENV_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
     let unquoted = r#"[^\s]*"#;
     let env_value = format!("(?:{}|{}|{})", double_quoted, single_quoted, unquoted);
     let env_assign = format!(r#"[A-Z_][A-Z0-9_]*={}"#, env_value);
-    Regex::new(&format!(r#"^(?:sudo\s+|env\s+|{}\s+)+"#, env_assign)).unwrap()
+    // NOTE: `sudo` is intentionally NOT stripped here. Rewriting `sudo docker ps`
+    // to `sudo rtk docker ps` breaks at runtime because `rtk` is not on root's
+    // secure_path, and (where it is) would run rtk itself as root. sudo commands
+    // are left untouched so they pass through unchanged. See #146.
+    Regex::new(&format!(r#"^(?:env\s+|{}\s+)+"#, env_assign)).unwrap()
 });
 // Git global options that appear before the subcommand: -C <path>, -c <key=val>,
 // --git-dir <dir>, --work-tree <dir>, and flag-only options (#163)
@@ -122,7 +126,7 @@ pub fn classify_command(cmd: &str) -> Classification {
         }
     }
 
-    // Strip env prefixes (sudo, env VAR=val, VAR=val)
+    // Strip env prefixes (env VAR=val, VAR=val); sudo is left untouched (#146)
     let stripped = ENV_PREFIX.replace(trimmed, "");
     let cmd_clean = stripped.trim();
     if cmd_clean.is_empty() {
@@ -2161,16 +2165,16 @@ mod tests {
     }
 
     #[test]
-    fn test_classify_sudo_stripped() {
-        assert_eq!(
-            classify_command("sudo docker ps"),
-            Classification::Supported {
-                rtk_equivalent: "rtk docker",
-                category: "Infra",
-                estimated_savings_pct: 85.0,
-                status: RtkStatus::Existing,
+    fn test_classify_sudo_not_stripped() {
+        // sudo is intentionally not stripped: sudo commands stay unclassified so
+        // they pass through unchanged rather than rewriting to a broken `sudo rtk`.
+        match classify_command("sudo docker ps") {
+            Classification::Unsupported { base_command } => {
+                // sudo is not peeled off, so the command is seen as-is (not `docker`).
+                assert_eq!(base_command, "sudo docker");
             }
-        );
+            other => panic!("expected Unsupported, got {:?}", other),
+        }
     }
 
     #[test]
@@ -4889,10 +4893,29 @@ mod tests {
     // --- sudo / env prefix + rewrite ---
 
     #[test]
-    fn test_rewrite_sudo_docker() {
+    fn test_rewrite_sudo_passthrough() {
+        // sudo commands are not rewritten (#146): `sudo rtk …` would fail under
+        // root's secure_path / run rtk as root. They pass through unchanged.
+        assert_eq!(rewrite_command_no_prefixes("sudo docker ps", &[]), None);
         assert_eq!(
-            rewrite_command_no_prefixes("sudo docker ps", &[]),
-            Some("sudo rtk docker ps".into())
+            rewrite_command_no_prefixes("sudo -u root docker ps", &[]),
+            None
+        );
+        assert_eq!(rewrite_command_no_prefixes("sudo git status", &[]), None);
+        // The passthrough must also survive an env prefix in front of sudo, a bare
+        // `sudo`, and must not catch `sudoedit` (#3569's motivating cases).
+        assert_eq!(
+            rewrite_command_no_prefixes("FOO=1 sudo docker ps", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("env FOO=1 sudo docker ps", &[]),
+            None
+        );
+        assert_eq!(rewrite_command_no_prefixes("sudo", &[]), None);
+        assert_eq!(
+            rewrite_command_no_prefixes("sudoedit /etc/hosts", &[]),
+            None
         );
     }
 
@@ -5583,8 +5606,17 @@ mod tests {
     #[test]
     fn test_env_prefix_composed_with_builtin() {
         assert_eq!(
+            rewrite_command_no_prefixes("FOO=bar noglob git status", &[]),
+            Some("FOO=bar noglob rtk git status".into())
+        );
+    }
+
+    #[test]
+    fn test_sudo_with_builtin_not_rewritten() {
+        // A leading sudo blocks the rewrite even when a transparent builtin follows.
+        assert_eq!(
             rewrite_command_no_prefixes("sudo noglob git status", &[]),
-            Some("sudo noglob rtk git status".into())
+            None
         );
     }
 
