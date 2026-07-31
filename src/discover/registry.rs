@@ -604,6 +604,7 @@ struct PipelineAnalysis {
     end_offset: usize,
     next_clause_offset: Option<usize>,
     final_stage_start: Option<usize>,
+    all_consumers_safe: bool,
 }
 
 fn analyze_pipeline(
@@ -625,12 +626,19 @@ fn analyze_pipeline(
     let mut stage_start = segment_start;
     let mut final_stage_start = None;
     let mut has_supported_structure = true;
+    let mut consumers_all_safe = true;
 
     for token in tokens {
         if token.offset >= end_offset {
             break;
         }
         if token.offset < first_pipe_offset {
+            continue;
+        }
+        // A redirect in a consumer stage (e.g. `| cat > out.txt`) persists the
+        // producer's output — rewriting would change what lands in the file.
+        if token.kind == TokenKind::Redirect {
+            consumers_all_safe = false;
             continue;
         }
         let TokenKind::Pipe(kind) = token.kind else {
@@ -640,6 +648,11 @@ fn analyze_pipeline(
         if cmd[stage_start..token.offset].trim().is_empty() || kind == PipeKind::StdoutAndStderr {
             has_supported_structure = false;
         }
+        if token.offset > first_pipe_offset
+            && !is_safe_pipe_consumer(cmd[stage_start..token.offset].trim())
+        {
+            consumers_all_safe = false;
+        }
 
         stage_start = token.offset + token.value.len();
         final_stage_start = Some(stage_start);
@@ -647,6 +660,8 @@ fn analyze_pipeline(
 
     if cmd[stage_start..end_offset].trim().is_empty() {
         has_supported_structure = false;
+    } else if !is_safe_pipe_consumer(cmd[stage_start..end_offset].trim()) {
+        consumers_all_safe = false;
     }
 
     PipelineAnalysis {
@@ -657,6 +672,7 @@ fn analyze_pipeline(
         } else {
             None
         },
+        all_consumers_safe: has_supported_structure && consumers_all_safe,
     }
 }
 
@@ -683,6 +699,40 @@ fn rewrite_pipeline_final_stage(
             "{} {}",
             cmd[segment_start..final_stage_start].trim(),
             rewritten
+        )
+    })
+}
+
+/// Rewrite the producer stage when every downstream consumer only truncates or
+/// passes through stdin (see [`SAFE_PIPE_CONSUMERS`]), so filtered output is
+/// still exactly what the agent would see: `git log | tail -5` →
+/// `rtk git log | tail -5`.
+fn rewrite_pipeline_producer(
+    cmd: &str,
+    segment_start: usize,
+    first_pipe_offset: usize,
+    analysis: PipelineAnalysis,
+    excluded: &[ExcludePattern],
+    transparent_prefixes: &[String],
+) -> Option<String> {
+    if !analysis.all_consumers_safe {
+        return None;
+    }
+    let producer = cmd[segment_start..first_pipe_offset].trim();
+
+    rewrite_segment_inner(
+        producer,
+        excluded,
+        transparent_prefixes,
+        RewriteContext::PipelineProducer,
+        0,
+    )
+    .filter(|rewritten| rewritten != producer)
+    .map(|rewritten| {
+        format!(
+            "{} {}",
+            rewritten,
+            cmd[first_pipe_offset..analysis.end_offset].trim()
         )
     })
 }
@@ -746,7 +796,17 @@ fn rewrite_compound(
                     analysis,
                     excluded,
                     transparent_prefixes,
-                );
+                )
+                .or_else(|| {
+                    rewrite_pipeline_producer(
+                        cmd,
+                        seg_start,
+                        tok.offset,
+                        analysis,
+                        excluded,
+                        transparent_prefixes,
+                    )
+                });
 
                 if let Some(rewritten) = rewritten_pipeline {
                     any_changed = true;
@@ -832,6 +892,20 @@ const ROUTABLE_WRAPPER_PREFIXES: &[&str] = &["uv run"];
 /// not spawnable, so they must never fall through: `rtk exec foo` cannot run.
 const SHELL_KEYWORD_PREFIXES: &[&str] = &["noglob", "command", "builtin", "exec", "nocorrect"];
 
+/// Pipe consumers that only truncate or pass through stdin, so a rewritten
+/// producer's filtered output is still exactly what the agent would see.
+const SAFE_PIPE_CONSUMERS: &[&str] = &["head", "tail", "cat"];
+
+/// Exact head-word match, no env-prefix/wrapper stripping: `FOO=1 tail`,
+/// `sudo tail`, `/usr/bin/tail` all fail the match and keep the pipeline raw —
+/// a missed optimization, never a false safe.
+fn is_safe_pipe_consumer(stage: &str) -> bool {
+    stage
+        .split_whitespace()
+        .next()
+        .is_some_and(|head| SAFE_PIPE_CONSUMERS.contains(&head))
+}
+
 /// Every built-in transparent wrapper, paired with whether it may fall through.
 /// Derived from the two lists above so they cannot drift apart.
 fn builtin_transparent_prefixes() -> impl Iterator<Item = (&'static str, bool)> {
@@ -847,6 +921,7 @@ const MAX_PREFIX_DEPTH: usize = 10;
 enum RewriteContext {
     Normal,
     PipelineFinal,
+    PipelineProducer,
 }
 
 /// Checks whether grep or rg reads patterns from a file.
@@ -1045,7 +1120,9 @@ fn rewrite_segment_inner(
         }
         // TOML-only commands: consult the registry so the hook filters them too (#2179).
         Classification::Unsupported { .. } => {
-            if context == RewriteContext::PipelineFinal {
+            // User TOML filters carry no pipeline-safety metadata — refuse in
+            // both pipeline contexts.
+            if context != RewriteContext::Normal {
                 return None;
             }
             if crate::core::toml_filter::toml_disabled() {
@@ -1072,6 +1149,12 @@ fn rewrite_segment_inner(
     if context == RewriteContext::PipelineFinal
         && (!rule.pipeline_final_safe || !pipeline_final_command_is_safe(rule.rtk_cmd, cmd_part))
     {
+        return None;
+    }
+    // head/tail/cat producers must stay raw: RULES maps them to `rtk read`,
+    // which would mangle `head -20 file | tail -5` into `rtk read -20 file …`
+    // and add markers a truncating consumer would surface instead of content.
+    if context == RewriteContext::PipelineProducer && rule.rtk_cmd == "rtk read" {
         return None;
     }
 
@@ -1209,6 +1292,21 @@ mod tests {
             cmd[analysis.final_stage_start.unwrap()..analysis.end_offset].trim(),
             "grep FAILED"
         );
+    }
+
+    #[test]
+    fn test_analyze_pipeline_all_consumers_safe() {
+        for cmd in ["git log | tail -5", "git log | head | cat"] {
+            assert!(analyze_test_pipeline(cmd).all_consumers_safe, "{cmd}");
+        }
+        for cmd in [
+            "git log | wc -l",
+            "git log | tail > f",
+            "cargo test |& tail",
+            "git log | FOO=1 tail",
+        ] {
+            assert!(!analyze_test_pipeline(cmd).all_consumers_safe, "{cmd}");
+        }
     }
 
     #[test]
@@ -1971,10 +2069,6 @@ mod tests {
     #[test]
     fn test_rewrite_pipe_unsafe_final_stage_stays_raw() {
         assert_eq!(
-            rewrite_command_no_prefixes("cargo test | tail -50", &[]),
-            None
-        );
-        assert_eq!(
             rewrite_command_no_prefixes("find . | xargs grep TODO", &[]),
             None
         );
@@ -2001,6 +2095,128 @@ mod tests {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | | grep FAILED", &[]),
             None
+        );
+    }
+
+    // --- Safe pipe consumers: producer rewrite ---
+
+    #[test]
+    fn test_rewrite_pipe_safe_consumers_producer_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | tail -5", &[]),
+            Some("rtk git log | tail -5".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("cargo test | tail -50", &[]),
+            Some("rtk cargo test | tail -50".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git diff | cat", &[]),
+            Some("rtk git diff | cat".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("RUST_BACKTRACE=1 cargo test 2>&1 | tail -50", &[]),
+            Some("RUST_BACKTRACE=1 rtk cargo test 2>&1 | tail -50".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_multi_pipe_all_safe_consumers() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | head -20 | tail -5", &[]),
+            Some("rtk git log | head -20 | tail -5".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_safe_consumer_with_next_clause() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | tail -5 && git status", &[]),
+            Some("rtk git log | tail -5 && rtk git status".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_mixed_consumers_stay_raw() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | head | wc -l", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | tail | xargs echo", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | grep feat | wc -l", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_producer_no_rule_or_excluded_stays_raw() {
+        assert_eq!(
+            rewrite_command_no_prefixes("unknowncmd | tail -5", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | tail -5", &["git log".into()]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("rtk git log | tail -5", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_consumer_decorations_stay_raw() {
+        // Conservative head-word match: decorated consumers keep the pipeline raw.
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | FOO=1 tail -5", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | /usr/bin/tail -5", &[]),
+            None
+        );
+        assert_eq!(rewrite_command_no_prefixes("git log |& tail -5", &[]), None);
+    }
+
+    #[test]
+    fn test_rewrite_pipe_consumer_redirect_stays_raw() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | tail -5 > out.txt", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | cat > file.txt", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_read_producer_stays_raw() {
+        // head/tail/cat producers map to `rtk read` in RULES — must stay raw.
+        assert_eq!(
+            rewrite_command_no_prefixes("head -20 file.txt | tail -5", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("cat file.txt | tail -5", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("tail -20 file.txt | head -5", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_final_grep_beats_producer_path() {
+        // Final-stage rewrite still wins; producer path only fires as fallback.
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | grep feat", &[]),
+            Some("git log | rtk grep feat".into())
         );
     }
 
@@ -4632,7 +4848,7 @@ mod tests {
     fn test_rewrite_pipe_then_and() {
         assert_eq!(
             rewrite_command_no_prefixes("git log | head -5 && git stash", &[]),
-            Some("git log | head -5 && rtk git stash".into())
+            Some("rtk git log | head -5 && rtk git stash".into())
         );
     }
 
@@ -4640,7 +4856,7 @@ mod tests {
     fn test_rewrite_pipe_then_semicolon() {
         assert_eq!(
             rewrite_command_no_prefixes("cargo test | head; git status", &[]),
-            Some("cargo test | head; rtk git status".into())
+            Some("rtk cargo test | head; rtk git status".into())
         );
     }
 
@@ -4675,7 +4891,7 @@ mod tests {
     fn test_rewrite_multi_pipe_then_and() {
         assert_eq!(
             rewrite_command_no_prefixes("git log | head | tail && git status", &[]),
-            Some("git log | head | tail && rtk git status".into())
+            Some("rtk git log | head | tail && rtk git status".into())
         );
     }
 
