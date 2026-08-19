@@ -31,7 +31,7 @@ const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode/rtk.ts");
 const PI_PLUGIN: &str = include_str!("../../hooks/pi/rtk.ts");
 
 // Embedded slim RTK awareness instructions
-const RTK_SLIM: &str = include_str!("../../hooks/claude/rtk-awareness.md");
+const RTK_SLIM: &str = include_str!("../../hooks/rtk-awareness.md");
 const RTK_SLIM_CODEX: &str = include_str!("../../hooks/codex/rtk-awareness.md");
 
 /// Template written by `rtk init` when no filters.toml exists yet.
