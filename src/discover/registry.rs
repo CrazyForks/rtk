@@ -1151,10 +1151,13 @@ fn rewrite_segment_inner(
     {
         return None;
     }
-    // head/tail/cat producers must stay raw: RULES maps them to `rtk read`,
-    // which would mangle `head -20 file | tail -5` into `rtk read -20 file …`
-    // and add markers a truncating consumer would surface instead of content.
-    if context == RewriteContext::PipelineProducer && rule.rtk_cmd == "rtk read" {
+    // Producers are opt-in per rule: rtk buffers the child's full output, so a
+    // non-terminating producer (ping, watch/serve modes) would starve the pipe.
+    // The pattern-file clause keeps `grep -f patterns.txt … | cat` raw, same as
+    // the final-stage gate above.
+    if context == RewriteContext::PipelineProducer
+        && (!rule.pipeline_producer_safe || !pipeline_final_command_is_safe(rule.rtk_cmd, cmd_part))
+    {
         return None;
     }
 
@@ -1307,6 +1310,85 @@ mod tests {
         ] {
             assert!(!analyze_test_pipeline(cmd).all_consumers_safe, "{cmd}");
         }
+    }
+
+    #[test]
+    fn test_pipeline_producer_safe_rule_set() {
+        // Producer-safe rules: pattern only matches invocations that terminate
+        // (no watch/serve/follow/REPL/editor modes, no unbounded streams, no
+        // rtk_cmd shared with such a rule). New rules default to unsafe;
+        // flipping one to safe must update this list consciously.
+        let mut safe_rules: Vec<_> = RULES
+            .iter()
+            .filter(|rule| rule.pipeline_producer_safe)
+            .map(|rule| rule.rtk_cmd)
+            .collect();
+        safe_rules.sort_unstable();
+        safe_rules.dedup();
+
+        assert_eq!(
+            safe_rules,
+            vec![
+                "rtk ansible-playbook",
+                "rtk brew",
+                "rtk bundle",
+                "rtk cargo",
+                "rtk composer",
+                "rtk df",
+                "rtk diff",
+                "rtk dotnet",
+                "rtk du",
+                "rtk ecs",
+                "rtk fail2ban-client",
+                "rtk find",
+                "rtk gh",
+                "rtk git",
+                "rtk glab",
+                "rtk go",
+                "rtk golangci-lint run",
+                "rtk grep",
+                "rtk hadolint",
+                "rtk helm",
+                "rtk iptables",
+                "rtk lint",
+                "rtk liquibase",
+                "rtk ls",
+                "rtk markdownlint",
+                "rtk mix",
+                "rtk mvn",
+                "rtk mypy",
+                "rtk next",
+                "rtk paratest",
+                "rtk pest",
+                "rtk phpstan",
+                "rtk phpunit",
+                "rtk pint",
+                "rtk pio",
+                "rtk pip",
+                "rtk poetry",
+                "rtk pre-commit",
+                "rtk prettier",
+                "rtk ps",
+                "rtk pytest",
+                "rtk quarto",
+                "rtk rake",
+                "rtk rg",
+                "rtk rspec",
+                "rtk rsync",
+                "rtk rubocop",
+                "rtk ruff",
+                "rtk shellcheck",
+                "rtk shopify",
+                "rtk swift",
+                "rtk systemctl",
+                "rtk terraform",
+                "rtk tofu",
+                "rtk tree",
+                "rtk trunk",
+                "rtk wc",
+                "rtk yamllint",
+            ]
+        );
     }
 
     #[test]
@@ -2208,6 +2290,55 @@ mod tests {
         assert_eq!(
             rewrite_command_no_prefixes("tail -20 file.txt | head -5", &[]),
             None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_producer_unsafe_rules_stay_raw() {
+        // Streaming producer would buffer forever inside rtk and starve head.
+        assert_eq!(
+            rewrite_command_no_prefixes("ping 127.0.0.1 | head -5", &[]),
+            None
+        );
+        // Watch/serve/follow modes reachable through the rule pattern.
+        assert_eq!(rewrite_command_no_prefixes("vitest | head", &[]), None);
+        assert_eq!(
+            rewrite_command_no_prefixes("npm run dev | head -5", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("docker logs app | tail -20", &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_producer_pattern_file_stays_raw() {
+        // rtk grep does not parse -f safely yet; same guard as the final stage.
+        assert_eq!(
+            rewrite_command_no_prefixes("grep -f patterns.txt input.txt | cat", &[]),
+            None
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("rg --file=patterns.txt input.txt | cat", &[]),
+            None
+        );
+        // Plain grep producer is safe.
+        assert_eq!(
+            rewrite_command_no_prefixes("grep foo src/main.rs | head -5", &[]),
+            Some("rtk grep foo src/main.rs | head -5".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pipe_producer_batch_rules_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes("pytest | tail -20", &[]),
+            Some("rtk pytest | tail -20".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("terraform plan | head -40", &[]),
+            Some("rtk terraform plan | head -40".into())
         );
     }
 
