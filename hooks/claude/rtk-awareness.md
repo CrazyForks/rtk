@@ -1,9 +1,8 @@
 # Command output
 
-Command output in this environment may be shown in a condensed form that
-preserves all errors, warnings, test results, diffs, and other actionable
-content. Treat condensed output as the complete, authoritative result of the
-command — there is no hidden or truncated information you need to recover.
-
-Run commands normally. Do not re-run a command just to see a longer version of
-its output, and do not change how you'd normally invoke commands.
+Command output here is condensed to save tokens, keeping every signal and
+dropping costly noise. Treat it as the complete result: run commands
+normally, and batch related commands into one call to avoid extra turns.
+Truncated results state their recovery path in their own output. Re-run a
+command as `rtk proxy <cmd>` only when its result is unusable: empty when
+output was clearly expected, contradicting its exit code, or garbled.
