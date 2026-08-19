@@ -5,10 +5,7 @@ pub struct RtkRule {
     pub rtk_cmd: &'static str,
     /// Whether this command may be rewritten as the final pipeline stage.
     pub pipeline_final_safe: bool,
-    /// Whether this command may be rewritten as a pipeline producer when every
-    /// downstream consumer is safe (rtk buffers the child's full output before
-    /// emitting, so the pattern must only match invocations that terminate:
-    /// no watch/serve/follow/REPL modes, no infinite streams like ping).
+    /// Whether this command may be rewritten as a pipeline producer (#3171).
     pub pipeline_producer_safe: bool,
     pub rewrite_prefixes: &'static [&'static str],
     pub category: &'static str,

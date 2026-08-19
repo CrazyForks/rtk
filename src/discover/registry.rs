@@ -635,8 +635,6 @@ fn analyze_pipeline(
         if token.offset < first_pipe_offset {
             continue;
         }
-        // A redirect in a consumer stage (e.g. `| cat > out.txt`) persists the
-        // producer's output — rewriting would change what lands in the file.
         if token.kind == TokenKind::Redirect {
             consumers_all_safe = false;
             continue;
@@ -703,10 +701,7 @@ fn rewrite_pipeline_final_stage(
     })
 }
 
-/// Rewrite the producer stage when every downstream consumer only truncates or
-/// passes through stdin (see [`SAFE_PIPE_CONSUMERS`]), so filtered output is
-/// still exactly what the agent would see: `git log | tail -5` →
-/// `rtk git log | tail -5`.
+// #3171
 fn rewrite_pipeline_producer(
     cmd: &str,
     segment_start: usize,
@@ -892,18 +887,58 @@ const ROUTABLE_WRAPPER_PREFIXES: &[&str] = &["uv run"];
 /// not spawnable, so they must never fall through: `rtk exec foo` cannot run.
 const SHELL_KEYWORD_PREFIXES: &[&str] = &["noglob", "command", "builtin", "exec", "nocorrect"];
 
-/// Pipe consumers that only truncate or pass through stdin, so a rewritten
-/// producer's filtered output is still exactly what the agent would see.
-const SAFE_PIPE_CONSUMERS: &[&str] = &["head", "tail", "cat"];
+struct SafePipeConsumer {
+    name: &'static str,
+    unsafe_flags: &'static [&'static str],
+    unsafe_flag_chars: &'static [char],
+}
 
-/// Exact head-word match, no env-prefix/wrapper stripping: `FOO=1 tail`,
-/// `sudo tail`, `/usr/bin/tail` all fail the match and keep the pipeline raw —
-/// a missed optimization, never a false safe.
+const SAFE_PIPE_CONSUMERS: &[SafePipeConsumer] = &[
+    SafePipeConsumer {
+        name: "head",
+        unsafe_flags: &[],
+        unsafe_flag_chars: &[],
+    },
+    // #3171: only non-following tail is display-only
+    SafePipeConsumer {
+        name: "tail",
+        unsafe_flags: &["-f", "-F", "--follow"],
+        unsafe_flag_chars: &['f', 'F'],
+    },
+    SafePipeConsumer {
+        name: "cat",
+        unsafe_flags: &[],
+        unsafe_flag_chars: &[],
+    },
+];
+
+fn arg_matches_unsafe_flag(consumer: &SafePipeConsumer, arg: &str) -> bool {
+    if consumer.unsafe_flags.iter().any(|flag| {
+        arg == *flag
+            || (flag.starts_with("--")
+                && arg
+                    .strip_prefix(*flag)
+                    .is_some_and(|rest| rest.starts_with('=')))
+    }) {
+        return true;
+    }
+    arg.strip_prefix('-')
+        .filter(|rest| !rest.starts_with('-'))
+        .is_some_and(|rest| {
+            rest.chars()
+                .any(|c| consumer.unsafe_flag_chars.contains(&c))
+        })
+}
+
 fn is_safe_pipe_consumer(stage: &str) -> bool {
-    stage
-        .split_whitespace()
-        .next()
-        .is_some_and(|head| SAFE_PIPE_CONSUMERS.contains(&head))
+    let mut words = stage.split_whitespace();
+    let Some(head) = words.next() else {
+        return false;
+    };
+    let Some(consumer) = SAFE_PIPE_CONSUMERS.iter().find(|c| c.name == head) else {
+        return false;
+    };
+    !words.any(|arg| arg_matches_unsafe_flag(consumer, arg))
 }
 
 /// Every built-in transparent wrapper, paired with whether it may fall through.
@@ -1120,8 +1155,6 @@ fn rewrite_segment_inner(
         }
         // TOML-only commands: consult the registry so the hook filters them too (#2179).
         Classification::Unsupported { .. } => {
-            // User TOML filters carry no pipeline-safety metadata — refuse in
-            // both pipeline contexts.
             if context != RewriteContext::Normal {
                 return None;
             }
@@ -1151,10 +1184,7 @@ fn rewrite_segment_inner(
     {
         return None;
     }
-    // Producers are opt-in per rule: rtk buffers the child's full output, so a
-    // non-terminating producer (ping, watch/serve modes) would starve the pipe.
-    // The pattern-file clause keeps `grep -f patterns.txt … | cat` raw, same as
-    // the final-stage gate above.
+    // #3171
     if context == RewriteContext::PipelineProducer
         && (!rule.pipeline_producer_safe || !pipeline_final_command_is_safe(rule.rtk_cmd, cmd_part))
     {
@@ -1314,10 +1344,6 @@ mod tests {
 
     #[test]
     fn test_pipeline_producer_safe_rule_set() {
-        // Producer-safe rules: pattern only matches invocations that terminate
-        // (no watch/serve/follow/REPL/editor modes, no unbounded streams, no
-        // rtk_cmd shared with such a rule). New rules default to unsafe;
-        // flipping one to safe must update this list consciously.
         let mut safe_rules: Vec<_> = RULES
             .iter()
             .filter(|rule| rule.pipeline_producer_safe)
@@ -2252,7 +2278,6 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_consumer_decorations_stay_raw() {
-        // Conservative head-word match: decorated consumers keep the pipeline raw.
         assert_eq!(
             rewrite_command_no_prefixes("git log | FOO=1 tail -5", &[]),
             None
@@ -2278,7 +2303,6 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_read_producer_stays_raw() {
-        // head/tail/cat producers map to `rtk read` in RULES — must stay raw.
         assert_eq!(
             rewrite_command_no_prefixes("head -20 file.txt | tail -5", &[]),
             None
@@ -2294,13 +2318,28 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_pipe_following_tail_stays_raw() {
+        for cmd in [
+            "git log | tail -f",
+            "git log | tail -F",
+            "git log | tail --follow",
+            "git log | tail --follow=name",
+            "git log | tail -fn20",
+        ] {
+            assert_eq!(rewrite_command_no_prefixes(cmd, &[]), None, "{cmd}");
+        }
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | tail -n 20", &[]),
+            Some("rtk git log | tail -n 20".into())
+        );
+    }
+
+    #[test]
     fn test_rewrite_pipe_producer_unsafe_rules_stay_raw() {
-        // Streaming producer would buffer forever inside rtk and starve head.
         assert_eq!(
             rewrite_command_no_prefixes("ping 127.0.0.1 | head -5", &[]),
             None
         );
-        // Watch/serve/follow modes reachable through the rule pattern.
         assert_eq!(rewrite_command_no_prefixes("vitest | head", &[]), None);
         assert_eq!(
             rewrite_command_no_prefixes("npm run dev | head -5", &[]),
@@ -2314,7 +2353,6 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_producer_pattern_file_stays_raw() {
-        // rtk grep does not parse -f safely yet; same guard as the final stage.
         assert_eq!(
             rewrite_command_no_prefixes("grep -f patterns.txt input.txt | cat", &[]),
             None
@@ -2323,7 +2361,6 @@ mod tests {
             rewrite_command_no_prefixes("rg --file=patterns.txt input.txt | cat", &[]),
             None
         );
-        // Plain grep producer is safe.
         assert_eq!(
             rewrite_command_no_prefixes("grep foo src/main.rs | head -5", &[]),
             Some("rtk grep foo src/main.rs | head -5".into())
@@ -2344,7 +2381,6 @@ mod tests {
 
     #[test]
     fn test_rewrite_pipe_final_grep_beats_producer_path() {
-        // Final-stage rewrite still wins; producer path only fires as fallback.
         assert_eq!(
             rewrite_command_no_prefixes("git log | grep feat", &[]),
             Some("git log | rtk grep feat".into())
