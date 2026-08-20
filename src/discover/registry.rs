@@ -895,6 +895,11 @@ struct SafePipeConsumer {
 
 const SAFE_PIPE_CONSUMERS: &[SafePipeConsumer] = &[
     SafePipeConsumer {
+        name: "cat",
+        unsafe_flags: &[],
+        unsafe_flag_chars: &[],
+    },
+    SafePipeConsumer {
         name: "head",
         unsafe_flags: &[],
         unsafe_flag_chars: &[],
@@ -904,11 +909,6 @@ const SAFE_PIPE_CONSUMERS: &[SafePipeConsumer] = &[
         name: "tail",
         unsafe_flags: &["-f", "-F", "--follow"],
         unsafe_flag_chars: &['f', 'F'],
-    },
-    SafePipeConsumer {
-        name: "cat",
-        unsafe_flags: &[],
-        unsafe_flag_chars: &[],
     },
 ];
 
@@ -972,7 +972,7 @@ fn search_uses_pattern_file(cmd: &str) -> bool {
         })
 }
 
-fn pipeline_final_command_is_safe(rtk_cmd: &str, cmd: &str) -> bool {
+fn pipeline_command_is_safe(rtk_cmd: &str, cmd: &str) -> bool {
     !matches!(rtk_cmd, "rtk grep" | "rtk rg") || !search_uses_pattern_file(cmd)
 }
 
@@ -1177,13 +1177,13 @@ fn rewrite_segment_inner(
     // Find the matching rule (rtk_cmd values are unique across all rules)
     let rule = RULES.iter().find(|r| r.rtk_cmd == rtk_equivalent)?;
     if context == RewriteContext::PipelineFinal
-        && (!rule.pipeline_final_safe || !pipeline_final_command_is_safe(rule.rtk_cmd, cmd_part))
+        && (!rule.pipeline_final_safe || !pipeline_command_is_safe(rule.rtk_cmd, cmd_part))
     {
         return None;
     }
     // #3171
     if context == RewriteContext::PipelineProducer
-        && (!rule.pipeline_producer_safe || !pipeline_final_command_is_safe(rule.rtk_cmd, cmd_part))
+        && (!rule.pipeline_producer_safe || !pipeline_command_is_safe(rule.rtk_cmd, cmd_part))
     {
         return None;
     }
@@ -1362,7 +1362,6 @@ mod tests {
                 "rtk du",
                 "rtk ecs",
                 "rtk find",
-                "rtk gh",
                 "rtk git",
                 "rtk go",
                 "rtk golangci-lint run",

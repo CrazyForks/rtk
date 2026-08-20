@@ -57,7 +57,6 @@ pub const RULES: &[RtkRule] = &[
     RtkRule {
         pattern: r"^gh\s+(pr|issue|run|repo|api|release)",
         rtk_cmd: "rtk gh",
-        pipeline_producer_safe: true,
         rewrite_prefixes: &["gh"],
         category: "GitHub",
         savings_pct: 82.0,
