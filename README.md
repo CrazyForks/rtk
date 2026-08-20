@@ -343,6 +343,10 @@ rtk init --show             # Verify installation
 
 After install, **restart Claude Code**.
 
+`RTK.md` tells the agent how to read condensed output and, by default, nothing about RTK itself.
+Set `[awareness] level = "high"` in `config.toml` if you want the agent to know `rtk gain`,
+`rtk proxy` and `RTK_DISABLED=1` — see [Configuration](docs/guide/getting-started/configuration.md#awareness-level).
+
 ## Windows
 
 RTK works fully on native Windows. Since **v0.37.2** the auto-rewrite hook runs as a **native binary command** (`rtk hook claude`) — no Unix shell, bash, or jq required — so commands are rewritten transparently on Command Prompt, PowerShell, and Windows Terminal, just like on Linux and macOS.
