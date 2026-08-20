@@ -907,7 +907,7 @@ const SAFE_PIPE_CONSUMERS: &[SafePipeConsumer] = &[
     // #3171: only non-following tail is display-only
     SafePipeConsumer {
         name: "tail",
-        unsafe_flags: &["-f", "-F", "--follow"],
+        unsafe_flags: &["--follow"],
         unsafe_flag_chars: &['f', 'F'],
     },
 ];
