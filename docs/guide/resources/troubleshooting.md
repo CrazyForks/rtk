@@ -62,29 +62,6 @@ rtk gain    # should now show token savings stats
    cat ~/.claude/settings.json | grep rtk
    ```
 
-## Agent no longer mentions RTK / won't run `rtk gain`
-
-**Symptom:** after upgrading and re-running `rtk init -g`, the agent answers "I don't know what
-rtk is", or you can no longer ask it to run `rtk gain` or bypass RTK.
-
-**Cause:** the default awareness file is intentionally silent about RTK. The hook rewrites
-commands transparently, so the agent does not need to know RTK exists.
-
-**Fix:** raise the level and re-run init:
-
-```toml
-# ~/.config/rtk/config.toml
-[awareness]
-level = "high"    # meta commands (rtk gain, rtk proxy, RTK_DISABLED=1)
-```
-
-```bash
-rtk init -g
-```
-
-Commands are still condensed at every level; only what the agent is told about RTK changes.
-See [Configuration → Awareness level](../getting-started/configuration.md#awareness-level).
-
 ## RTK not found after `cargo install`
 
 **Symptom:**

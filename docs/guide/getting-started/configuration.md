@@ -58,61 +58,24 @@ For full details on what is collected, opt-out options, and GDPR rights, see [Te
 
 ## Awareness level
 
-`rtk init` writes a short instructions file that your agent loads at the start of every session
-(`~/.claude/RTK.md`, `~/.gemini/GEMINI.md`, `~/.vibe/prompts/rtk.md`, …). `awareness.level`
-controls how much that file tells the agent about RTK.
-
-### Why the file is nearly silent by default
-
-RTK is a transparent proxy. With a command hook installed, the agent runs `git status`, the hook
-rewrites it to `rtk git status`, and the agent sees condensed output without knowing RTK exists.
-That is the whole point: no prompt-level instructions to follow, no `rtk` prefixes to remember,
-nothing to get wrong.
-
-Earlier versions shipped a `RTK.md` that listed commands, savings percentages, and
-"always prefix with `rtk`" rules. That text cost tokens on every turn and taught the agent to
-talk about RTK, retry with and without the prefix, or skip the prefix "to see more". The
-`default` level replaces it with a few lines that only explain how to read condensed output.
-
-### Levels
+`rtk init` writes a short instructions file for your agent (`~/.claude/RTK.md`, `~/.gemini/GEMINI.md`, …).
+`awareness.level` sets how much it says about RTK. Output is condensed the same way at every level.
 
 | Level | The agent is told | Pick it when |
 |-------|-------------------|--------------|
-| `default` | Output is condensed; treat it as complete; batch commands; truncated output states its own recovery path; `rtk proxy <cmd>` only if the result is unusable. Nothing about RTK itself. | You have a hook-based agent and want RTK invisible. This is the default. |
-| `high` | `default` + what RTK is, that a hook does the rewriting, and the meta commands: `rtk gain`, `rtk proxy <cmd>`, `RTK_DISABLED=1 <cmd>`, `rtk discover`. | You want to be able to ask the agent "how many tokens did RTK save?" or "run that without RTK". |
-| `full` | `high` + "prefix every shell command with `rtk`", including inside `&&` chains. | Your agent has no hook, or you deliberately want the agent to drive RTK itself. |
-
-Each level contains the previous one verbatim, so the output-reading rules are identical at every
-level; only how much the agent knows about RTK changes.
+| `default` | How to read condensed output. Nothing about RTK. | Hook-based agent, RTK stays invisible. |
+| `high` | `default` + what RTK is and `rtk gain`, `rtk proxy`, `RTK_DISABLED=1`, `rtk discover`. | You want to ask the agent about savings or to bypass RTK. |
+| `full` | `high` + "prefix every command with `rtk`". | Agent without a hook, or you want the agent to drive RTK itself. |
 
 ```toml
 [awareness]
 level = "high"
 ```
 
-Then re-run the init command for your agent (`rtk init -g`, `rtk init -g --gemini`,
-`rtk init -g --agent vibe`, …). The file is rewritten only when its content changes, and the
-summary line shows which level was written (`RTK.md: ~/.claude/RTK.md (awareness: high)`).
+Re-run `rtk init -g` (or your agent's init command) to rewrite the file.
 
-### Agents without a hook always get `full`
-
-Codex CLI, Cline, Windsurf, Kilo Code, Antigravity and Kimi have no command hook: RTK only runs
-if the agent types `rtk` itself, and only the `full` text tells it to. `rtk init` therefore
-writes `full` for those agents regardless of `awareness.level`, and prints a note:
-
-```
-Awareness: full — Kilo Code has no command hook, so the agent is told to prefix rtk itself (config awareness.level = "default" does not apply here)
-```
-
-One `config.toml` can serve a hook-based agent at `default` and a rules-file agent at `full`
-on the same machine; nothing to switch between them.
-
-### Upgrading from an older `RTK.md`
-
-The next `rtk init -g` replaces the old command-list `RTK.md` with the `default` file. If you
-relied on the agent knowing RTK (for example asking it to run `rtk gain`), set `level = "high"`
-before re-running. `rtk init --claude-md` still writes the legacy full command table into
-`CLAUDE.md` for anyone who wants it.
+Agents without a hook (Codex CLI, Cline, Windsurf, Kilo Code, Antigravity, Kimi) always get `full`,
+since the agent must type `rtk` itself. `rtk init` prints a note when it does this.
 
 ## Environment variables
 

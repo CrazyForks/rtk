@@ -343,9 +343,7 @@ rtk init --show             # Verify installation
 
 After install, **restart Claude Code**.
 
-`RTK.md` tells the agent how to read condensed output and, by default, nothing about RTK itself.
-Set `[awareness] level = "high"` in `config.toml` if you want the agent to know `rtk gain`,
-`rtk proxy` and `RTK_DISABLED=1` — see [Configuration](docs/guide/getting-started/configuration.md#awareness-level).
+By default `RTK.md` says nothing about RTK itself. Set `[awareness] level = "high"` in `config.toml` to let the agent know `rtk gain` / `rtk proxy` — see [Configuration](docs/guide/getting-started/configuration.md#awareness-level).
 
 ## Windows
 
