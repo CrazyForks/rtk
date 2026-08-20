@@ -913,21 +913,18 @@ const SAFE_PIPE_CONSUMERS: &[SafePipeConsumer] = &[
 ];
 
 fn arg_matches_unsafe_flag(consumer: &SafePipeConsumer, arg: &str) -> bool {
-    if consumer.unsafe_flags.iter().any(|flag| {
-        arg == *flag
-            || (flag.starts_with("--")
-                && arg
-                    .strip_prefix(*flag)
-                    .is_some_and(|rest| rest.starts_with('=')))
-    }) {
-        return true;
+    if let Some(rest) = arg.strip_prefix("--") {
+        let name = rest.split_once('=').map_or(rest, |(name, _)| name);
+        return !name.is_empty()
+            && consumer.unsafe_flags.iter().any(|flag| {
+                flag.strip_prefix("--")
+                    .is_some_and(|full| full.starts_with(name))
+            });
     }
-    arg.strip_prefix('-')
-        .filter(|rest| !rest.starts_with('-'))
-        .is_some_and(|rest| {
-            rest.chars()
-                .any(|c| consumer.unsafe_flag_chars.contains(&c))
-        })
+    arg.strip_prefix('-').is_some_and(|rest| {
+        rest.chars()
+            .any(|c| consumer.unsafe_flag_chars.contains(&c))
+    })
 }
 
 fn is_safe_pipe_consumer(stage: &str) -> bool {
@@ -1355,7 +1352,6 @@ mod tests {
         assert_eq!(
             safe_rules,
             vec![
-                "rtk ansible-playbook",
                 "rtk brew",
                 "rtk bundle",
                 "rtk cargo",
@@ -1365,11 +1361,9 @@ mod tests {
                 "rtk dotnet",
                 "rtk du",
                 "rtk ecs",
-                "rtk fail2ban-client",
                 "rtk find",
                 "rtk gh",
                 "rtk git",
-                "rtk glab",
                 "rtk go",
                 "rtk golangci-lint run",
                 "rtk grep",
@@ -1400,7 +1394,6 @@ mod tests {
                 "rtk rake",
                 "rtk rg",
                 "rtk rspec",
-                "rtk rsync",
                 "rtk rubocop",
                 "rtk ruff",
                 "rtk shellcheck",
@@ -2324,6 +2317,8 @@ mod tests {
             "git log | tail -F",
             "git log | tail --follow",
             "git log | tail --follow=name",
+            "git log | tail --foll",
+            "git log | tail --f",
             "git log | tail -fn20",
         ] {
             assert_eq!(rewrite_command_no_prefixes(cmd, &[]), None, "{cmd}");

@@ -67,7 +67,6 @@ pub const RULES: &[RtkRule] = &[
     RtkRule {
         pattern: r"^glab\s+(mr|issue|ci|pipeline|api|release)",
         rtk_cmd: "rtk glab",
-        pipeline_producer_safe: true,
         rewrite_prefixes: &["glab"],
         category: "GitLab",
         savings_pct: 82.0,
@@ -690,7 +689,6 @@ pub const RULES: &[RtkRule] = &[
     RtkRule {
         pattern: r"^ansible-playbook\b",
         rtk_cmd: "rtk ansible-playbook",
-        pipeline_producer_safe: true,
         rewrite_prefixes: &["ansible-playbook"],
         category: "Infra",
         savings_pct: 70.0,
@@ -742,7 +740,6 @@ pub const RULES: &[RtkRule] = &[
     RtkRule {
         pattern: r"^fail2ban-client\b",
         rtk_cmd: "rtk fail2ban-client",
-        pipeline_producer_safe: true,
         rewrite_prefixes: &["fail2ban-client"],
         category: "Infra",
         ..RtkRule::DEFAULT
@@ -894,7 +891,6 @@ pub const RULES: &[RtkRule] = &[
     RtkRule {
         pattern: r"^rsync\b",
         rtk_cmd: "rtk rsync",
-        pipeline_producer_safe: true,
         rewrite_prefixes: &["rsync"],
         category: "Network",
         savings_pct: 65.0,
