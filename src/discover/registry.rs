@@ -360,15 +360,15 @@ fn strip_golangci_global_opts(cmd: &str) -> String {
 
 /// Parse supported golangci-lint invocations with optional global flags before `run`.
 fn parse_golangci_run_parts(cmd: &str) -> Option<GolangciRunParts<'_>> {
-    let tokens = split_token_spans(cmd);
+    let tokens = tokenize(cmd);
     let first = tokens.first()?;
-    if first.0 != "golangci-lint" && first.0 != "golangci" {
+    if first.value != "golangci-lint" && first.value != "golangci" {
         return None;
     }
 
     let mut i = 1;
     while i < tokens.len() {
-        let token = tokens[i].0;
+        let token = tokens[i].value.as_str();
 
         if token == "--" {
             return None;
@@ -377,11 +377,11 @@ fn parse_golangci_run_parts(cmd: &str) -> Option<GolangciRunParts<'_>> {
         if !token.starts_with('-') {
             if token == "run" {
                 let global_segment = if i > 1 {
-                    cmd[tokens[1].1..tokens[i].1].trim()
+                    cmd[tokens[1].offset..tokens[i].offset].trim()
                 } else {
                     ""
                 };
-                let run_segment = cmd[tokens[i].1..].trim();
+                let run_segment = cmd[tokens[i].offset..].trim();
                 return Some(GolangciRunParts {
                     global_segment,
                     run_segment,
@@ -424,27 +424,6 @@ fn golangci_flag_takes_separate_value(arg: &str, flag: &str) -> bool {
     }
 
     true
-}
-
-fn split_token_spans(cmd: &str) -> Vec<(&str, usize, usize)> {
-    let mut tokens = Vec::new();
-    let mut start = None;
-
-    for (idx, ch) in cmd.char_indices() {
-        if ch.is_whitespace() {
-            if let Some(token_start) = start.take() {
-                tokens.push((&cmd[token_start..idx], token_start, idx));
-            }
-        } else if start.is_none() {
-            start = Some(idx);
-        }
-    }
-
-    if let Some(token_start) = start {
-        tokens.push((&cmd[token_start..], token_start, cmd.len()));
-    }
-
-    tokens
 }
 
 /// Normalize absolute binary paths: `/usr/bin/grep -rn foo` → `grep -rn foo` (#485)
@@ -3701,6 +3680,21 @@ mod tests {
     fn test_classify_golangci_lint_with_inline_value_flag_before_run() {
         assert!(matches!(
             classify_command("golangci-lint --color=never run ./..."),
+            Classification::Supported {
+                rtk_equivalent: "rtk golangci-lint run",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_golangci_lint_with_quoted_value_flag_before_run() {
+        // A quoted global-flag value containing a space (`--config "a path/x.yml"`)
+        // must not be split at the space inside the quotes — split_token_spans
+        // (whitespace-only, quote-blind) used to mis-split this into "\"a" and
+        // "path/x.yml\"", which made parse_golangci_run_parts miss `run` entirely.
+        assert!(matches!(
+            classify_command(r#"golangci-lint --config "a path/x.yml" run ./..."#),
             Classification::Supported {
                 rtk_equivalent: "rtk golangci-lint run",
                 ..
