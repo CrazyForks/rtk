@@ -57,6 +57,17 @@ pub(crate) fn is_word_boundary_whitespace(c: char) -> bool {
     c.is_whitespace() && c != '\r'
 }
 
+/// True if the byte at `i` is a `\r` immediately followed by `\n` — the two
+/// bytes of a CRLF pair. Shared by `tokenize_inner`'s newline-operator arm and
+/// `registry.rs::rewrite_multiline_block`'s raw-newline-byte parity check, so
+/// the two can't independently drift on what counts as a CRLF pair the way
+/// they had before this was extracted (flagged during the PR #3600 review
+/// that prompted this consolidation: registry.rs's `raw_breaks` re-derived
+/// this exact rule via its own byte scan instead of sharing it).
+pub(crate) fn is_crlf_at(bytes: &[u8], i: usize) -> bool {
+    bytes.get(i) == Some(&b'\r') && bytes.get(i + 1) == Some(&b'\n')
+}
+
 fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -275,7 +286,9 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
             // as a single command — so gating on it would over-segment and the
             // rewriter would mis-join it. A lone `\r` falls through to the `_` arm
             // below like any other non-IFS byte, never a word or command boundary.
-            c @ ('\n' | '\r') if emit_newline && (c == '\n' || chars.peek() == Some(&'\n')) => {
+            c @ ('\n' | '\r')
+                if emit_newline && (c == '\n' || is_crlf_at(input.as_bytes(), byte_pos)) =>
+            {
                 flush_arg(&mut tokens, &mut current, current_start);
                 tokens.push(ParsedToken {
                     kind: TokenKind::Operator,

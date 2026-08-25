@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use super::lexer::{
-    advance_quote_state, shell_split, split_on_operators, tokenize, tokenize_with_newlines,
-    ParsedToken, PipeKind, TokenKind,
+    advance_quote_state, is_crlf_at, is_word_boundary_whitespace, shell_split, split_on_operators,
+    tokenize, tokenize_with_newlines, ParsedToken, PipeKind, TokenKind,
 };
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
@@ -360,15 +360,15 @@ fn strip_golangci_global_opts(cmd: &str) -> String {
 
 /// Parse supported golangci-lint invocations with optional global flags before `run`.
 fn parse_golangci_run_parts(cmd: &str) -> Option<GolangciRunParts<'_>> {
-    let tokens = tokenize(cmd);
+    let tokens = split_token_spans(cmd);
     let first = tokens.first()?;
-    if first.value != "golangci-lint" && first.value != "golangci" {
+    if first.0 != "golangci-lint" && first.0 != "golangci" {
         return None;
     }
 
     let mut i = 1;
     while i < tokens.len() {
-        let token = tokens[i].value.as_str();
+        let token = tokens[i].0;
 
         if token == "--" {
             return None;
@@ -377,11 +377,11 @@ fn parse_golangci_run_parts(cmd: &str) -> Option<GolangciRunParts<'_>> {
         if !token.starts_with('-') {
             if token == "run" {
                 let global_segment = if i > 1 {
-                    cmd[tokens[1].offset..tokens[i].offset].trim()
+                    cmd[tokens[1].1..tokens[i].1].trim()
                 } else {
                     ""
                 };
-                let run_segment = cmd[tokens[i].offset..].trim();
+                let run_segment = cmd[tokens[i].1..].trim();
                 return Some(GolangciRunParts {
                     global_segment,
                     run_segment,
@@ -424,6 +424,47 @@ fn golangci_flag_takes_separate_value(arg: &str, flag: &str) -> bool {
     }
 
     true
+}
+
+/// Quote-aware whitespace word-splitter: a maximal run of non-whitespace
+/// characters, or a quoted span (which may itself contain whitespace), is one
+/// word. Deliberately *not* the full shell `tokenize()`: golangci-lint
+/// flag/value parsing only needs "was there a space here", not shell syntax —
+/// an unquoted value like `--config *.yml` must stay one word, not split into
+/// `*` and `.yml` the way `tokenize()` would (it treats `*` as its own
+/// Shellism token even outside quotes). Built on the same `advance_quote_state`
+/// primitive `tokenize_inner`/`shell_split`/`QuoteScan` use, so this can't
+/// independently drift on what counts as "inside a quote".
+fn split_token_spans(cmd: &str) -> Vec<(&str, usize)> {
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut quote: Option<char> = None;
+
+    for (idx, ch) in cmd.char_indices() {
+        let was_quoted = quote.is_some();
+        quote = advance_quote_state(quote, ch);
+        if was_quoted || quote.is_some() {
+            // Inside a quoted span (or this char just opened/closed one):
+            // never a word boundary, quotes included in the word verbatim.
+            if start.is_none() {
+                start = Some(idx);
+            }
+            continue;
+        }
+        if is_word_boundary_whitespace(ch) {
+            if let Some(token_start) = start.take() {
+                tokens.push((&cmd[token_start..idx], token_start));
+            }
+        } else if start.is_none() {
+            start = Some(idx);
+        }
+    }
+
+    if let Some(token_start) = start {
+        tokens.push((&cmd[token_start..], token_start));
+    }
+
+    tokens
 }
 
 /// Normalize absolute binary paths: `/usr/bin/grep -rn foo` → `grep -rn foo` (#485)
@@ -838,7 +879,7 @@ fn rewrite_multiline_block(
     let raw_breaks = bytes
         .iter()
         .enumerate()
-        .filter(|&(i, &b)| b == b'\n' || (b == b'\r' && bytes.get(i + 1) == Some(&b'\n')))
+        .filter(|&(i, &b)| b == b'\n' || is_crlf_at(bytes, i))
         .count();
     if raw_breaks != newline_offsets.len() {
         // Every newline swallowed by quote state with quotes balanced at EOF
@@ -3807,6 +3848,25 @@ mod tests {
         // "path/x.yml\"", which made parse_golangci_run_parts miss `run` entirely.
         assert!(matches!(
             classify_command(r#"golangci-lint --config "a path/x.yml" run ./..."#),
+            Classification::Supported {
+                rtk_equivalent: "rtk golangci-lint run",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_golangci_lint_with_unquoted_glob_value_flag_before_run() {
+        // An UNQUOTED global-flag value containing a shell metacharacter
+        // (`--config *.yml`) must also stay one word. Routing this through the
+        // full shell tokenize() (rather than a quote-aware but syntax-blind
+        // word splitter) regressed this: tokenize() treats `*` as its own
+        // Shellism token even outside quotes, splitting "*.yml" into "*" and
+        // ".yml" and desyncing the flag-value-skip loop, which then reads
+        // ".yml" where it expects "run" and misclassifies the whole command as
+        // Unsupported. Caught by /code-review high.
+        assert!(matches!(
+            classify_command("golangci-lint --config *.yml run ./..."),
             Classification::Supported {
                 rtk_equivalent: "rtk golangci-lint run",
                 ..
