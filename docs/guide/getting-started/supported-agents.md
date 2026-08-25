@@ -36,6 +36,7 @@ Agent runs "cargo test"
 | OpenCode | TypeScript plugin (`tool.execute.before`) | Yes |
 | OpenClaw | TypeScript plugin (`before_tool_call`) | Yes |
 | Pi | TypeScript extension (`tool_call` event) | Yes |
+| Oh My Pi (OMP) | TypeScript extension (`tool_call` event, shared with Pi) | Yes |
 | Hermes | Python plugin (`terminal` command mutation) | Yes |
 | Factory Droid | Shell hook (`PreToolUse`, matcher `Execute`) | Yes |
 | Cline / Roo Code | Rules file (prompt-level) | N/A |
@@ -121,6 +122,27 @@ rtk init --uninstall --agent pi --global
 ```
 
 Removes only the installed Pi extension file.
+
+### Oh My Pi (OMP)
+
+```bash
+# Project-local (default)
+rtk init --agent omp
+
+# Global — all projects
+rtk init --agent omp --global
+```
+
+Creates `.omp/extensions/rtk.ts` (local) or `~/.omp/agent/extensions/rtk.ts` (global). OMP loads the same extension file as Pi through its `legacy-pi-compat` layer, so both agents share `rtk.ts`.
+
+Uninstall:
+
+```bash
+rtk init --uninstall --agent omp
+rtk init --uninstall --agent omp --global
+```
+
+Removes only the installed OMP extension file. If the file has been modified after install, uninstall aborts with a message instead of removing it.
 
 ### OpenClaw
 

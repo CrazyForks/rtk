@@ -38,6 +38,13 @@ pub const PI_EXTENSIONS_SUBDIR: &str = "extensions";
 pub const PI_PLUGIN_FILE: &str = "rtk.ts";
 pub const PI_CODING_AGENT_DIR_ENV: &str = "PI_CODING_AGENT_DIR";
 
+/// Oh My Pi (OMP) home subdirectory (`$HOME/.omp/agent`) and project
+/// subdirectory (`.omp`). OMP loads the same extension file as Pi through
+/// its `legacy-pi-compat` layer, so both agents share `PI_EXTENSIONS_SUBDIR`
+/// and `PI_PLUGIN_FILE`.
+pub const OMP_DIR: &str = ".omp/agent";
+pub const OMP_LOCAL_DIR: &str = ".omp";
+
 /// Factory Droid config directory, joined onto the resolved home directory.
 pub const DROID_DIR: &str = ".factory";
 /// Canonical Droid hooks file (Droid's own /hooks UI reads and writes this).

@@ -17,9 +17,10 @@ use super::constants::{
     DROID_EXECUTE_MATCHER, DROID_HOME_ENV, DROID_HOOKS_FILE, DROID_HOOKS_SUBDIR,
     DROID_HOOK_COMMAND, DROID_SETTINGS_FILE, GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR,
     HERMES_PLUGIN_INIT_FILE, HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON,
-    HOOKS_SUBDIR, PI_CODING_AGENT_DIR_ENV, PI_DIR, PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR,
-    PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON, VIBE_BASH_MATCH, VIBE_DIR,
-    VIBE_HOOKS_FILE, VIBE_HOOK_COMMAND, VIBE_HOOK_NAME, VIBE_PROMPTS_SUBDIR, VIBE_PROMPT_FILE,
+    HOOKS_SUBDIR, OMP_DIR, OMP_LOCAL_DIR, PI_CODING_AGENT_DIR_ENV, PI_DIR, PI_EXTENSIONS_SUBDIR,
+    PI_LOCAL_DIR, PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
+    VIBE_BASH_MATCH, VIBE_DIR, VIBE_HOOKS_FILE, VIBE_HOOK_COMMAND, VIBE_HOOK_NAME,
+    VIBE_PROMPTS_SUBDIR, VIBE_PROMPT_FILE,
 };
 use super::integrity;
 use super::is_claude_hook_command;
@@ -638,13 +639,14 @@ fn remove_hook_from_settings(ctx: InitContext) -> Result<bool> {
     Ok(removed)
 }
 
-/// Full uninstall for Claude, Gemini, Codex, Cursor, or Pi artifacts.
+/// Full uninstall for Claude, Gemini, Codex, Cursor, Pi, or OMP artifacts.
 pub fn uninstall(
     global: bool,
     gemini: bool,
     codex: bool,
     cursor: bool,
     pi: bool,
+    omp: bool,
     ctx: InitContext,
 ) -> Result<()> {
     let InitContext { verbose, dry_run } = ctx;
@@ -685,6 +687,11 @@ pub fn uninstall(
 
     if pi {
         uninstall_pi(global, ctx)?;
+        return Ok(());
+    }
+
+    if omp {
+        uninstall_omp(global, ctx)?;
         return Ok(());
     }
 
@@ -3556,6 +3563,121 @@ fn remove_opencode_plugin(ctx: InitContext) -> Result<Vec<PathBuf>> {
     Ok(removed)
 }
 
+// ─── Oh My Pi (OMP) support ──────────────────────────────────────────
+
+// OMP ships a `legacy-pi-compat` layer that remaps the Pi coding-agent
+// extension API, so it loads the exact same extension file as Pi
+// (`hooks/pi/rtk.ts`, embedded as `PI_PLUGIN`). Only the install paths
+// differ:
+//
+//   global=true  -> `$HOME/.omp/agent/extensions/rtk.ts`
+//   global=false -> `.omp/extensions/rtk.ts`
+
+/// Return the OMP extension install path for the given scope.
+fn omp_extension_path_for_scope(global: bool) -> Result<PathBuf> {
+    if global {
+        Ok(resolve_home_subdir(OMP_DIR)?
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE))
+    } else {
+        Ok(PathBuf::from(OMP_LOCAL_DIR)
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE))
+    }
+}
+
+/// Install the shared Pi extension file for OMP (hook-only; no AGENTS.md
+/// injection). OMP loads the file through its `legacy-pi-compat` layer.
+///
+/// global=true  -> `$HOME/.omp/agent/extensions/rtk.ts`
+/// global=false -> `.omp/extensions/rtk.ts`
+pub fn run_omp_mode(global: bool, ctx: InitContext) -> Result<()> {
+    let InitContext {
+        verbose: _,
+        dry_run,
+    } = ctx;
+    let path = omp_extension_path_for_scope(global)?;
+    if let Some(parent) = path.parent() {
+        ensure_pi_extensions_dir(
+            parent,
+            if global {
+                "OMP extensions directory"
+            } else {
+                "local OMP extensions directory"
+            },
+            ctx,
+        )?;
+    }
+
+    let installed = write_if_changed(path.as_path(), PI_PLUGIN, "OMP extension", ctx)?;
+
+    if dry_run {
+        print_dry_run_footer();
+    } else {
+        print_omp_result(&path, installed);
+    }
+
+    Ok(())
+}
+
+fn print_omp_result(extension_path: &Path, installed: bool) {
+    let status = if installed {
+        "installed"
+    } else {
+        "already up to date"
+    };
+    println!("RTK OMP extension {}:", status);
+    println!("  Extension: {}", extension_path.display());
+    println!();
+    println!("OMP will load the extension automatically on next start.");
+}
+
+/// Uninstall the OMP extension for the given scope.
+///
+/// The installed file is the shared stock Pi extension. Stock content is
+/// removed outright. RTK content that no longer matches the stock file is
+/// left in place with a manual-removal notice. Unrelated content is never
+/// touched.
+pub fn uninstall_omp(global: bool, ctx: InitContext) -> Result<()> {
+    let InitContext { verbose, dry_run } = ctx;
+    let path = omp_extension_path_for_scope(global)?;
+
+    if !path.exists() {
+        println!("RTK OMP extension was not installed (nothing to remove)");
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read OMP extension: {}", path.display()))?;
+
+    if content.trim() == PI_PLUGIN.trim() {
+        if dry_run {
+            println!("[dry-run] would remove OMP extension: {}", path.display());
+        } else {
+            // nosemgrep: filesystem-deletion -- OMP uninstall removes only the RTK-managed extension file.
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove OMP extension: {}", path.display()))?;
+            if verbose > 0 {
+                eprintln!("Removed OMP extension: {}", path.display());
+            }
+            println!("RTK uninstalled (OMP):");
+            println!("  - Extension: {}", path.display());
+        }
+    } else if content.contains("rtk rewrite") {
+        anyhow::bail!(
+            "OMP extension at {} contains RTK content that does not match the stock extension. Remove the file manually.",
+            path.display()
+        );
+    } else {
+        println!(
+            "OMP extension at {} is not RTK content; leaving it alone.",
+            path.display()
+        );
+    }
+
+    Ok(())
+}
+
 // ─── Cursor Agent support ─────────────────────────────────────────────
 
 fn resolve_cursor_dir() -> Result<PathBuf> {
@@ -3869,12 +3991,52 @@ fn remove_cursor_hook_from_json(root: &mut serde_json::Value) -> bool {
 }
 
 /// Show current rtk configuration
-pub fn show_config(codex: bool) -> Result<()> {
+pub fn show_config(codex: bool, omp: bool) -> Result<()> {
+    if omp {
+        return show_omp_config();
+    }
     if codex {
         return show_codex_config();
     }
 
     show_claude_config()
+}
+
+/// Show OMP configuration status.
+fn show_omp_config() -> Result<()> {
+    let global_extension = omp_extension_path_for_scope(true)?;
+    let project_extension = omp_extension_path_for_scope(false)?;
+
+    println!("rtk Configuration (Oh My Pi):\n");
+    print_omp_extension_status("Global extension", &global_extension)?;
+    print_omp_extension_status("Project extension", &project_extension)?;
+
+    println!("\nUsage:");
+    println!("  rtk init --agent omp                 # Configure ./.omp/extensions/rtk.ts");
+    println!("  rtk init -g --agent omp              # Configure ~/.omp/agent/extensions/rtk.ts");
+    println!("  rtk init --agent omp --uninstall     # Remove project OMP RTK extension");
+    println!("  rtk init -g --agent omp --uninstall  # Remove global OMP RTK extension");
+
+    Ok(())
+}
+
+fn print_omp_extension_status(label: &str, path: &Path) -> Result<()> {
+    if path.exists() {
+        let content = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        if content.trim() == PI_PLUGIN.trim() {
+            println!("  {}: {} (up to date)", label, path.display());
+        } else {
+            println!(
+                "  {}: {} (modified - will be replaced on next rtk init)",
+                label,
+                path.display()
+            );
+        }
+    } else {
+        println!("  {}: {} (not installed)", label, path.display());
+    }
+    Ok(())
 }
 
 fn show_claude_config() -> Result<()> {
@@ -7221,7 +7383,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         with_claude_dir_override(&tmp, |claude_dir| {
             run_default_mode(true, PatchMode::Auto, false, InitContext::default()).unwrap();
-            uninstall(true, false, false, false, false, InitContext::default()).unwrap();
+            uninstall(
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                InitContext::default(),
+            )
+            .unwrap();
 
             assert!(!claude_dir.join(RTK_MD).exists(), "RTK.md must be removed");
             let settings_content =
@@ -7349,7 +7520,7 @@ mod tests {
                 dry_run: true,
                 ..Default::default()
             };
-            uninstall(true, false, false, false, false, dry).unwrap();
+            uninstall(true, false, false, false, false, false, dry).unwrap();
 
             // Files must still exist with identical content
             assert!(
@@ -7575,7 +7746,16 @@ mod tests {
             let plugin = pi_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
             assert!(plugin.exists());
 
-            uninstall(true, false, false, false, true, InitContext::default()).unwrap();
+            uninstall(
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+                InitContext::default(),
+            )
+            .unwrap();
 
             assert!(!plugin.exists(), "plugin must be removed");
         });
@@ -7589,7 +7769,15 @@ mod tests {
         std::env::set_current_dir(tmp.path()).unwrap();
 
         run_pi_mode(false, InitContext::default()).unwrap();
-        let result = uninstall(false, false, false, false, true, InitContext::default());
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            InitContext::default(),
+        );
         std::env::set_current_dir(&cwd).unwrap();
         result.unwrap();
 
@@ -7688,6 +7876,7 @@ mod tests {
                 false,
                 false,
                 true,
+                false,
                 InitContext {
                     verbose: 0,
                     dry_run: true,
@@ -7726,6 +7915,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             InitContext {
                 verbose: 0,
                 dry_run: true,
@@ -7738,6 +7928,227 @@ mod tests {
             plugin.exists(),
             "dry-run uninstall must not remove the local Pi extension"
         );
+    }
+
+    // ─── OMP tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_omp_extension_path_for_scope_local() {
+        let path = omp_extension_path_for_scope(false).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from(OMP_LOCAL_DIR)
+                .join(PI_EXTENSIONS_SUBDIR)
+                .join(PI_PLUGIN_FILE)
+        );
+    }
+
+    #[test]
+    fn test_omp_extension_path_for_scope_global() {
+        let path = omp_extension_path_for_scope(true).unwrap();
+        assert!(path.is_absolute());
+        assert!(
+            path.to_string_lossy().contains(OMP_DIR),
+            "unexpected global OMP path: {}",
+            path.display()
+        );
+        assert!(path.ends_with("extensions/rtk.ts"));
+    }
+
+    #[test]
+    fn test_omp_local_install_writes_shared_pi_extension() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        run_omp_mode(false, InitContext::default()).unwrap();
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let path = tmp
+            .path()
+            .join(OMP_LOCAL_DIR)
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE);
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content.trim(), PI_PLUGIN.trim());
+    }
+
+    #[test]
+    fn test_omp_local_install_dry_run_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        run_omp_mode(
+            false,
+            InitContext {
+                verbose: 0,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let path = tmp
+            .path()
+            .join(OMP_LOCAL_DIR)
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE);
+        assert!(!path.exists());
+        assert!(!tmp.path().join(OMP_LOCAL_DIR).exists());
+    }
+
+    #[test]
+    fn test_omp_local_uninstall_removes_plugin() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        run_omp_mode(false, InitContext::default()).unwrap();
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext::default(),
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+        result.unwrap();
+
+        let path = tmp
+            .path()
+            .join(OMP_LOCAL_DIR)
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_omp_local_uninstall_dry_run_keeps_plugin() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        run_omp_mode(false, InitContext::default()).unwrap();
+        let plugin = tmp
+            .path()
+            .join(OMP_LOCAL_DIR)
+            .join(PI_EXTENSIONS_SUBDIR)
+            .join(PI_PLUGIN_FILE);
+        assert!(
+            plugin.exists(),
+            "plugin must exist before uninstall dry-run"
+        );
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext {
+                verbose: 0,
+                dry_run: true,
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+        result.unwrap();
+
+        assert!(
+            plugin.exists(),
+            "dry-run uninstall must not remove the local OMP extension"
+        );
+    }
+
+    #[test]
+    fn test_omp_uninstall_modified_extension_bails() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(OMP_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(
+            &path,
+            "// user-modified extension\nexport default (pi) => { rtk rewrite hook }\n",
+        )
+        .unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext::default(),
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not match the stock extension"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(path.exists(), "modified extension must not be removed");
+    }
+
+    #[test]
+    fn test_omp_uninstall_unrelated_content_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(OMP_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(&path, "export default () => {}\n").unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext::default(),
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+        result.unwrap();
+
+        assert!(path.exists(), "non-RTK extension must be left in place");
+    }
+
+    #[test]
+    fn test_omp_uninstall_missing_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext::default(),
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+        result.unwrap();
     }
 
     // ─── Copilot tests ───────────────────────────────────────────────
