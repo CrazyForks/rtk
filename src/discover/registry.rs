@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use super::lexer::{
-    shell_split, split_on_operators, tokenize, tokenize_with_newlines, ParsedToken, PipeKind,
-    TokenKind,
+    advance_quote_state, shell_split, split_on_operators, tokenize, tokenize_with_newlines,
+    ParsedToken, PipeKind, TokenKind,
 };
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
@@ -640,8 +640,10 @@ const BLOCK_KEYWORDS: &[&str] = &[
 struct QuoteScan<'a> {
     bytes: &'a [u8],
     i: usize,
-    in_single: bool,
-    in_double: bool,
+    // Same `Option<char>` model `tokenize_inner`/`shell_split` use, driven by
+    // the shared `advance_quote_state` — not an independently-maintained pair
+    // of bools, so this can't drift from the lexer's own quote handling.
+    quote: Option<char>,
 }
 
 impl<'a> QuoteScan<'a> {
@@ -649,13 +651,12 @@ impl<'a> QuoteScan<'a> {
         Self {
             bytes: s.as_bytes(),
             i: 0,
-            in_single: false,
-            in_double: false,
+            quote: None,
         }
     }
 
     fn balanced(&self) -> bool {
-        !self.in_single && !self.in_double
+        self.quote.is_none()
     }
 }
 
@@ -666,15 +667,13 @@ impl Iterator for QuoteScan<'_> {
         while self.i < self.bytes.len() {
             let i = self.i;
             let b = self.bytes[i];
-            if b == b'\\' && !self.in_single {
+            if b == b'\\' && self.quote != Some('\'') {
                 self.i += 2;
                 continue;
             }
-            let item = (i, b, self.in_single, self.in_double);
-            match b {
-                b'\'' if !self.in_double => self.in_single = !self.in_single,
-                b'"' if !self.in_single => self.in_double = !self.in_double,
-                _ => {}
+            let item = (i, b, self.quote == Some('\''), self.quote == Some('"'));
+            if b == b'\'' || b == b'"' {
+                self.quote = advance_quote_state(self.quote, b as char);
             }
             self.i += 1;
             return Some(item);

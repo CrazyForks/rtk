@@ -33,6 +33,21 @@ pub fn tokenize_with_newlines(input: &str) -> Vec<ParsedToken> {
     tokenize_inner(input, true)
 }
 
+/// Applies one character's effect on quote state, mirroring bash: an
+/// unescaped `'` or `"` opens a quote span if none is open, and only the same
+/// character closes it (a `"` inside a `'...'` span, or vice versa, is just
+/// literal text). Shared by the char-based tokenizer (`tokenize_inner`,
+/// `shell_split`) and every byte-based line scanner in `registry.rs`
+/// (`QuoteScan`), so the different representations of "am I inside a quote"
+/// can't independently drift the way they had before this was extracted.
+pub(crate) fn advance_quote_state(quote: Option<char>, c: char) -> Option<char> {
+    match (quote, c) {
+        (None, '\'' | '"') => Some(c),
+        (Some(q), c) if c == q => None,
+        (q, _) => q,
+    }
+}
+
 /// Bash's default `$IFS` is space/tab/newline — never a bare `\r`. Shared by
 /// the lexer's own word-splitting and by permission-pattern normalization
 /// (`permissions.rs::command_matches_pattern`) so the two can't independently
@@ -70,19 +85,11 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
             continue;
         }
 
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            current.push(c);
-            byte_pos += char_len;
-            continue;
-        }
-        if c == '\'' || c == '"' {
-            quote = Some(c);
-            if current.is_empty() {
+        if quote.is_some() || c == '\'' || c == '"' {
+            if quote.is_none() && current.is_empty() {
                 current_start = byte_pos;
             }
+            quote = advance_quote_state(quote, c);
             current.push(c);
             byte_pos += char_len;
             continue;
@@ -474,23 +481,27 @@ pub fn shell_split(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut chars = input.chars().peekable();
-    let mut in_single = false;
-    let mut in_double = false;
+    let mut quote: Option<char> = None;
 
     while let Some(c) = chars.next() {
         match c {
-            '\\' if !in_single => {
+            '\\' if quote != Some('\'') => {
                 if let Some(next) = chars.next() {
                     current.push(next);
                 }
             }
-            '\'' if !in_double => {
-                in_single = !in_single;
+            '\'' | '"' => {
+                // advance_quote_state leaves `quote` unchanged when `c` is the
+                // "wrong" quote char for the current span (e.g. a `'` while
+                // inside `"..."`) — that's literal text, not a toggle.
+                let new_quote = advance_quote_state(quote, c);
+                if new_quote == quote {
+                    current.push(c);
+                } else {
+                    quote = new_quote;
+                }
             }
-            '"' if !in_single => {
-                in_double = !in_double;
-            }
-            ' ' | '\t' if !in_single && !in_double => {
+            ' ' | '\t' if quote.is_none() => {
                 if !current.is_empty() {
                     tokens.push(std::mem::take(&mut current));
                 }
