@@ -68,6 +68,36 @@ pub(crate) fn is_crlf_at(bytes: &[u8], i: usize) -> bool {
     bytes.get(i) == Some(&b'\r') && bytes.get(i + 1) == Some(&b'\n')
 }
 
+/// Merges lexer tokens that are directly adjacent in `cmd` (no whitespace or
+/// other gap between them) into single words — the gap between "one lexer
+/// token" and "one bash word": `tokenize()` splits `*.yml` into a
+/// `Shellism("*")` and an `Arg(".yml")` for shell-syntax purposes, but bash
+/// sees one word since nothing separates them. Callers that only need
+/// "was there a space here" (not full shell-operator awareness) build on
+/// this instead of re-scanning `cmd` themselves.
+pub(crate) fn coalesce_words<'a>(cmd: &'a str, tokens: &[ParsedToken]) -> Vec<(&'a str, usize)> {
+    let mut words = Vec::new();
+    let mut run_start: Option<usize> = None;
+    let mut run_end: usize = 0;
+
+    for tok in tokens {
+        if let Some(start) = run_start {
+            if tok.offset != run_end {
+                words.push((&cmd[start..run_end], start));
+                run_start = None;
+            }
+        }
+        if run_start.is_none() {
+            run_start = Some(tok.offset);
+        }
+        run_end = tok.offset + tok.value.len();
+    }
+    if let Some(start) = run_start {
+        words.push((&cmd[start..run_end], start));
+    }
+    words
+}
+
 fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -562,6 +592,23 @@ pub fn shell_split(input: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_coalesce_words_merges_adjacent_tokens() {
+        let cmd = "golangci-lint --config *.yml run";
+        let words: Vec<&str> = coalesce_words(cmd, &tokenize(cmd))
+            .into_iter()
+            .map(|(w, _)| w)
+            .collect();
+        assert_eq!(words, vec!["golangci-lint", "--config", "*.yml", "run"]);
+    }
+
+    #[test]
+    fn test_coalesce_words_preserves_offsets() {
+        let cmd = "a *.yml b";
+        let words = coalesce_words(cmd, &tokenize(cmd));
+        assert_eq!(words, vec![("a", 0), ("*.yml", 2), ("b", 8)]);
+    }
 
     #[test]
     fn test_simple_command() {

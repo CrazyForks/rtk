@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::LazyLock;
 
 use super::lexer::{
-    advance_quote_state, is_crlf_at, is_word_boundary_whitespace, shell_split, split_on_operators,
-    tokenize, tokenize_with_newlines, ParsedToken, PipeKind, TokenKind,
+    advance_quote_state, coalesce_words, is_crlf_at, shell_split, split_on_operators, tokenize,
+    tokenize_with_newlines, ParsedToken, PipeKind, TokenKind,
 };
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
@@ -426,45 +426,15 @@ fn golangci_flag_takes_separate_value(arg: &str, flag: &str) -> bool {
     true
 }
 
-/// Quote-aware whitespace word-splitter: a maximal run of non-whitespace
-/// characters, or a quoted span (which may itself contain whitespace), is one
-/// word. Deliberately *not* the full shell `tokenize()`: golangci-lint
-/// flag/value parsing only needs "was there a space here", not shell syntax —
-/// an unquoted value like `--config *.yml` must stay one word, not split into
-/// `*` and `.yml` the way `tokenize()` would (it treats `*` as its own
-/// Shellism token even outside quotes). Built on the same `advance_quote_state`
-/// primitive `tokenize_inner`/`shell_split`/`QuoteScan` use, so this can't
-/// independently drift on what counts as "inside a quote".
+/// Quote-aware word splitting for golangci-lint's flag/value parsing: "was
+/// there a space here", not shell syntax — deliberately not the full
+/// `tokenize()` output, since an unquoted glob like `*.yml` must stay one
+/// word rather than split on `*` the way shell-operator tokenizing would.
+/// Built directly on `tokenize()` + `coalesce_words` (merging any tokens the
+/// full tokenizer split apart but that sit with no gap between them), so this
+/// runs no bespoke scanning of its own.
 fn split_token_spans(cmd: &str) -> Vec<(&str, usize)> {
-    let mut tokens = Vec::new();
-    let mut start: Option<usize> = None;
-    let mut quote: Option<char> = None;
-
-    for (idx, ch) in cmd.char_indices() {
-        let was_quoted = quote.is_some();
-        quote = advance_quote_state(quote, ch);
-        if was_quoted || quote.is_some() {
-            // Inside a quoted span (or this char just opened/closed one):
-            // never a word boundary, quotes included in the word verbatim.
-            if start.is_none() {
-                start = Some(idx);
-            }
-            continue;
-        }
-        if is_word_boundary_whitespace(ch) {
-            if let Some(token_start) = start.take() {
-                tokens.push((&cmd[token_start..idx], token_start));
-            }
-        } else if start.is_none() {
-            start = Some(idx);
-        }
-    }
-
-    if let Some(token_start) = start {
-        tokens.push((&cmd[token_start..], token_start));
-    }
-
-    tokens
+    coalesce_words(cmd, &tokenize(cmd))
 }
 
 /// Normalize absolute binary paths: `/usr/bin/grep -rn foo` → `grep -rn foo` (#485)
