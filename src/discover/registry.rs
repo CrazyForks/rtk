@@ -852,9 +852,16 @@ fn rewrite_multiline_block(
         return None;
     }
 
-    // The lexer emits one newline token per `\r` and per `\n` (CRLF = two
-    // tokens), so the parity check must count both bytes individually.
-    let raw_breaks = cmd.chars().filter(|c| matches!(c, '\n' | '\r')).count();
+    // The lexer emits a newline token for each `\n` and for the `\r` of a CRLF
+    // pair (CRLF = two tokens), but NOT for a lone `\r` (a bare CR is not a
+    // separator). Count exactly that set here, so the parity check flags only
+    // newlines the lexer swallowed via quote state — never a lone CR.
+    let bytes = cmd.as_bytes();
+    let raw_breaks = bytes
+        .iter()
+        .enumerate()
+        .filter(|&(i, &b)| b == b'\n' || (b == b'\r' && bytes.get(i + 1) == Some(&b'\n')))
+        .count();
     if raw_breaks != newline_offsets.len() {
         // Every newline swallowed by quote state with quotes balanced at EOF
         // is one logical command (a multi-line commit message), not a hidden

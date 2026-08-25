@@ -33,6 +33,15 @@ pub fn tokenize_with_newlines(input: &str) -> Vec<ParsedToken> {
     tokenize_inner(input, true)
 }
 
+/// Bash's default `$IFS` is space/tab/newline — never a bare `\r`. Shared by
+/// the lexer's own word-splitting and by permission-pattern normalization
+/// (`permissions.rs::command_matches_pattern`) so the two can't independently
+/// diverge on what counts as whitespace, which is how a lone-CR bug fixed here
+/// once reappeared there as a separate, undetected regression.
+pub(crate) fn is_word_boundary_whitespace(c: char) -> bool {
+    c.is_whitespace() && c != '\r'
+}
+
 fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -253,7 +262,13 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                 });
                 current_start = byte_pos;
             }
-            '\n' | '\r' if emit_newline => {
+            // `\n`, and the `\r` of a CRLF pair, are command separators. A lone `\r`
+            // (classic-Mac EOL, not followed by `\n`) is NOT: bash treats a bare CR
+            // as an ordinary character inside a word — `git status<CR>git log` runs
+            // as a single command — so gating on it would over-segment and the
+            // rewriter would mis-join it. A lone `\r` falls through to the `_` arm
+            // below like any other non-IFS byte, never a word or command boundary.
+            c @ ('\n' | '\r') if emit_newline && (c == '\n' || chars.peek() == Some(&'\n')) => {
                 flush_arg(&mut tokens, &mut current, current_start);
                 tokens.push(ParsedToken {
                     kind: TokenKind::Operator,
@@ -263,7 +278,7 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                 byte_pos += char_len;
                 current_start = byte_pos;
             }
-            c if c.is_whitespace() => {
+            c if is_word_boundary_whitespace(c) => {
                 flush_arg(&mut tokens, &mut current, current_start);
                 byte_pos += c.len_utf8();
                 current_start = byte_pos;
@@ -1361,5 +1376,32 @@ mod tests {
         assert_eq!(newline_ops("git status\ngit log"), 1);
         assert_eq!(newline_ops("echo 'line1\nline2'"), 0);
         assert_eq!(newline_ops("git status\r\ngit log"), 2);
+        // A lone `\r` (no following `\n`) is not a separator → no newline operator.
+        assert_eq!(newline_ops("git status\rgit log"), 0);
+    }
+
+    #[test]
+    fn test_lone_cr_is_not_a_word_boundary() {
+        // Bash's default $IFS is space/tab/newline, never CR: a bare `\r` with no
+        // following `\n` stays glued into its surrounding word instead of splitting
+        // it, matching how real bash tokenizes `git status<CR>git log`.
+        let args: Vec<String> = tokenize("git status\rgit log")
+            .into_iter()
+            .map(|t| t.value)
+            .collect();
+        assert_eq!(args, vec!["git", "status\rgit", "log"]);
+    }
+
+    #[test]
+    fn test_crlf_in_plain_tokenize_keeps_cr_glued_to_word() {
+        // Plain `tokenize()` (emit_newline=false) treats `\n` as ordinary IFS
+        // whitespace but never `\r` — a `\r` right before it is not a separator,
+        // so it stays glued to the word it terminates, same as real bash would
+        // keep a bare CR byte attached to its word.
+        let args: Vec<String> = tokenize("git status\r\ngit log")
+            .into_iter()
+            .map(|t| t.value)
+            .collect();
+        assert_eq!(args, vec!["git", "status\r", "git", "log"]);
     }
 }

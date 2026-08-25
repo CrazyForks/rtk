@@ -3,7 +3,7 @@ use super::constants::{
     SETTINGS_JSON, SETTINGS_LOCAL_JSON,
 };
 use crate::core::stream::exec_capture;
-use crate::discover::lexer::split_for_permissions;
+use crate::discover::lexer::{is_word_boundary_whitespace, split_for_permissions};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -383,8 +383,18 @@ pub(crate) fn extract_bash_pattern(rule: &str) -> &str {
 /// - `* suffix`, `pre * suf` → glob matching where `*` matches any sequence of characters
 /// - `pattern` → exact match or prefix match (cmd must equal pattern or start with `{pattern} `)
 pub(crate) fn command_matches_pattern(cmd: &str, pattern: &str) -> bool {
-    let cmd_norm = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
-    let pattern_norm = pattern.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Shares the lexer's definition of a word boundary (`is_word_boundary_whitespace`)
+    // instead of `str::split_whitespace()`'s Unicode-whitespace notion, so a bare
+    // `\r` embedded in `cmd` is never collapsed into a space here — matching how
+    // the lexer itself now treats a lone `\r` as part of the word, not a boundary.
+    let normalize = |s: &str| {
+        s.split(is_word_boundary_whitespace)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let cmd_norm = normalize(cmd);
+    let pattern_norm = normalize(pattern);
     let cmd = cmd_norm.as_str();
     let pattern = pattern_norm.as_str();
 
@@ -944,6 +954,29 @@ mod tests {
             check_command_with_rules("git status\nrm -rf ~", &[], &[], &allow),
             PermissionVerdict::Default
         );
+    }
+
+    #[test]
+    fn test_lone_cr_hidden_command_not_auto_allowed() {
+        // `split_for_permissions` correctly treats a lone `\r` (no `\n`) as part
+        // of one command, not a boundary. Before command_matches_pattern shared
+        // the lexer's word-boundary definition, its own `split_whitespace()`
+        // still collapsed the embedded `\r` into a space, so "git status\rrm -rf
+        // ~" normalized to "git status rm -rf ~" and matched an allow rule for
+        // "git status" it should never have matched.
+        let allow = vec!["git status".to_string()];
+        assert_eq!(
+            check_command_with_rules("git status\rrm -rf ~", &[], &[], &allow),
+            PermissionVerdict::Default
+        );
+    }
+
+    #[test]
+    fn test_lone_cr_does_not_collapse_to_space_in_pattern_match() {
+        assert!(!command_matches_pattern(
+            "git status\rrm -rf ~",
+            "git status"
+        ));
     }
 
     #[test]
