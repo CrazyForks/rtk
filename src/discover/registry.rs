@@ -1017,6 +1017,19 @@ fn rewrite_pipeline_final_stage(
 }
 
 /// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
+///
+/// This walk is the third of three compound-command segmenters in this
+/// codebase — see the comparison table on
+/// [`crate::discover::lexer::split_for_permissions`] (the permission gate's
+/// segmenter) for the full picture. This one also splits on background `&`
+/// (`TokenKind::Shellism if tok.value == "&"` below), but — unlike
+/// `split_for_permissions` — does **not** treat standalone `(`/`)` as a
+/// segment boundary (only bails out entirely via `has_opaque_grouping` when a
+/// pipe and a grouping char coexist) and does not truncate segments at a
+/// redirect (redirects are preserved verbatim in the rewritten output, by
+/// design). These differences are deliberate: the permission gate must stay
+/// the most conservative of the three, this function's job is to reproduce
+/// the command's actual shape, not to defend against it hiding something.
 fn rewrite_compound(
     cmd: &str,
     excluded: &[ExcludePattern],
@@ -1486,6 +1499,105 @@ mod tests {
 
     fn rewrite_command_no_prefixes(cmd: &str, excluded: &[String]) -> Option<String> {
         super::rewrite_command(cmd, excluded, &[])
+    }
+
+    // Three compound-command segmenters look at the same kind of input for
+    // different, deliberate purposes — split_for_permissions (the permission
+    // gate, most conservative), split_on_operators/split_command_chain
+    // (analytics/discovery classification), and rewrite_compound's inline
+    // token walk (actual rewrite). See the comparison table on
+    // split_for_permissions's doc comment. These tests pin today's actual,
+    // intentionally-divergent behavior for each, side by side, so a future
+    // edit to any one of them that accidentally drifts its policy fails here
+    // immediately instead of silently diverging further from the other two.
+    mod segmenter_consistency {
+        use super::{rewrite_command_no_prefixes, split_command_chain};
+        use crate::discover::lexer::split_for_permissions;
+
+        #[test]
+        fn background_ampersand() {
+            let cmd = "git status & rm -rf ~";
+            // Permission gate: splits on background `&` — both sides checked independently.
+            assert_eq!(split_for_permissions(cmd), vec!["git status", "rm -rf ~"]);
+            // Analytics: does not split on `&` at all (only Operator/Pipe kinds).
+            assert_eq!(split_command_chain(cmd), vec!["git status & rm -rf ~"]);
+            // Rewrite: does split on `&` (each side is its own rtk-rewrite
+            // candidate), but only "git status" is a known rtk command family —
+            // "rm -rf ~" has no rtk equivalent, so it's left unprefixed, not
+            // because it wasn't segmented.
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some("rtk git status & rm -rf ~".into())
+            );
+        }
+
+        #[test]
+        fn subshell_grouping() {
+            let cmd = "(git status; cargo build)";
+            // Permission gate: strips `(`/`)` as boundaries — both commands checked cleanly.
+            assert_eq!(
+                split_for_permissions(cmd),
+                vec!["git status", "cargo build"]
+            );
+            // Analytics: does not treat `(`/`)` as boundaries, only splits on `;` —
+            // the parens stay glued to the segment text on each side.
+            assert_eq!(
+                split_command_chain(cmd),
+                vec!["(git status", "cargo build)"]
+            );
+            // Rewrite: same non-splitting-on-parens behavior. The leading `(`
+            // glued to "git status" defeats rewrite_segment's own command
+            // matching (it no longer starts with "git"), so that side is left
+            // unprefixed; the trailing `)` glued after "cargo build" does not
+            // defeat matching on that side, so it gets prefixed. This asymmetry
+            // is a real, existing quirk of gluing grouping chars to segment
+            // text rather than stripping them — pinned here, not fixed here.
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some("(git status; rtk cargo build)".into())
+            );
+        }
+
+        #[test]
+        fn pipe_then_and() {
+            let cmd = "git status | grep x && cargo build";
+            // Permission gate: always splits on `|` — every stage checked independently.
+            assert_eq!(
+                split_for_permissions(cmd),
+                vec!["git status", "grep x", "cargo build"]
+            );
+            // Analytics: split_command_chain stops entirely at the first `|`,
+            // discarding everything after it (including the later `&&` clause) —
+            // it only needs to classify what's in front of the pipe.
+            assert_eq!(split_command_chain(cmd), vec!["git status"]);
+            // Rewrite: pipelines are handled specially (rewrite_pipeline_final_stage),
+            // and clauses after the pipeline are still walked and rewritten.
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some("git status | rtk grep x && rtk cargo build".into())
+            );
+        }
+
+        #[test]
+        fn redirect_in_segment() {
+            let cmd = "git status 2>&1 && cargo build";
+            // Permission gate: truncates the segment at its first redirect.
+            assert_eq!(
+                split_for_permissions(cmd),
+                vec!["git status", "cargo build"]
+            );
+            // Analytics: keeps the redirect attached to the segment.
+            assert_eq!(
+                split_command_chain(cmd),
+                vec!["git status 2>&1", "cargo build"]
+            );
+            // Rewrite: also keeps the redirect — rewritten output must
+            // reproduce the command's actual shape, redirect included.
+            assert_eq!(
+                rewrite_command_no_prefixes(cmd, &[]),
+                Some("rtk git status 2>&1 && rtk cargo build".into())
+            );
+        }
     }
 
     mod multiline_blocks {

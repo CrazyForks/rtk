@@ -375,8 +375,26 @@ fn redirect_has_file_target(tokens: &[ParsedToken], i: usize) -> bool {
     }
 }
 
+/// Segments `cmd` for the **permission gate** (`permissions.rs::check_command_with_rules`):
+/// every segment this returns is independently checked against deny/ask/allow
+/// rules, so this is deliberately the most paranoid of the three compound-command
+/// segmenters in this codebase — see [`split_on_operators`] (analytics/discovery
+/// classification) and `registry.rs::rewrite_compound`'s inline token walk (actual
+/// rewrite) for the other two, which intentionally segment the same kind of input
+/// differently:
+///
+/// | | here (permission gate) | [`split_on_operators`] (analytics) | `rewrite_compound` (rewrite) |
+/// |---|---|---|---|
+/// | `&&` / `\|\|` / `;` | splits | splits | splits |
+/// | `\|` | always splits | stops at first `\|` | pipeline handled specially |
+/// | background `&` | splits (Shellism boundary) | does not split | splits |
+/// | `( ... )` grouping | splits (Shellism boundary) | does not split | does not split standalone |
+/// | trailing redirect | truncates the segment | kept | kept (rewritten output preserves it) |
+///
 /// Like [`split_on_operators`] but also breaks on newline, background `&`, and
-/// subshell `( ... )`, and truncates each segment at its first redirect.
+/// subshell `( ... )`, and truncates each segment at its first redirect —
+/// deliberately conservative so a hidden command can't evade the gate by
+/// hiding behind a construct another segmenter would leave intact.
 /// Callers must still gate on [`contains_unattestable_construct`] first.
 pub fn split_for_permissions(cmd: &str) -> Vec<&str> {
     let trimmed = cmd.trim();
@@ -424,6 +442,15 @@ pub fn split_for_permissions(cmd: &str) -> Vec<&str> {
 /// (used by command rewriting — only the left side of a pipe gets rewritten).
 /// When false, splits through pipes too (used by permission checking —
 /// every segment must be validated).
+///
+/// Its only current caller (`registry.rs::split_command_chain`, used for
+/// analytics/discovery classification) passes `stop_at_pipe: true`, and unlike
+/// [`split_for_permissions`] never splits on background `&` or `( ... )`
+/// grouping, and never truncates at a redirect — see the comparison table on
+/// [`split_for_permissions`] for the full picture across all three
+/// compound-command segmenters. That's fine for classification (it only needs
+/// to identify supported commands, not defend against a hidden one), but this
+/// function must not be repurposed for permission/security decisions as-is.
 pub fn split_on_operators(cmd: &str, stop_at_pipe: bool) -> Vec<&str> {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
