@@ -75,6 +75,17 @@ pub(crate) fn is_crlf_at(bytes: &[u8], i: usize) -> bool {
 /// sees one word since nothing separates them. Callers that only need
 /// "was there a space here" (not full shell-operator awareness) build on
 /// this instead of re-scanning `cmd` themselves.
+///
+/// Callers only use each `ParsedToken`'s `offset`/`value.len()` here — the
+/// `String` `tokenize()` heap-allocates per token is discarded once that's
+/// read, since the returned words are re-sliced straight from `cmd`. Not
+/// worth avoiding: this runs once per single command-line-length input, well
+/// inside RTK's <10ms/<5MB targets — a handful of short-lived allocations for
+/// maybe a dozen tokens, not a hot loop. Trading the shared `tokenize()` call
+/// for a second, offset-only scanning primitive to dodge them would resurrect
+/// the exact "one more parallel implementation" problem this consolidation
+/// exists to remove, for a gain nothing here actually needs (confirmed via
+/// `/code-review high`, which flagged this and rated it not worth fixing).
 pub(crate) fn coalesce_words<'a>(cmd: &'a str, tokens: &[ParsedToken]) -> Vec<(&'a str, usize)> {
     let mut words = Vec::new();
     let mut run_start: Option<usize> = None;
@@ -547,17 +558,23 @@ pub fn strip_quotes(s: &str) -> String {
     s.to_string()
 }
 
-pub fn shell_split(input: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut chars = input.chars().peekable();
+/// Turns one coalesced word's raw text (quotes and backslash escapes still
+/// literal, exactly as `tokenize()` preserves them) into the argv-ready text
+/// `shell_split`'s callers need: quote characters that actually open/close a
+/// span are stripped, backslash escapes are resolved (dropped, keeping the
+/// escaped character). The inverse of what `tokenize_inner` preserves — built
+/// on the same `advance_quote_state` so it can't drift from the tokenizer's
+/// own quote model.
+fn resolve_word_text(raw: &str) -> String {
+    let mut result = String::new();
+    let mut chars = raw.chars().peekable();
     let mut quote: Option<char> = None;
 
     while let Some(c) = chars.next() {
         match c {
             '\\' if quote != Some('\'') => {
                 if let Some(next) = chars.next() {
-                    current.push(next);
+                    result.push(next);
                 }
             }
             '\'' | '"' => {
@@ -566,27 +583,36 @@ pub fn shell_split(input: &str) -> Vec<String> {
                 // inside `"..."`) — that's literal text, not a toggle.
                 let new_quote = advance_quote_state(quote, c);
                 if new_quote == quote {
-                    current.push(c);
+                    result.push(c);
                 } else {
                     quote = new_quote;
                 }
             }
-            ' ' | '\t' if quote.is_none() => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            _ => {
-                current.push(c);
-            }
+            _ => result.push(c),
         }
     }
 
-    if !current.is_empty() {
-        tokens.push(current);
-    }
+    result
+}
 
-    tokens
+/// Quote-aware split of a single shell command into argv-ready words: quotes
+/// stripped, backslash escapes resolved — for callers that hand the result
+/// straight to `Command::new`/exec or compare it against literal words
+/// (`hooks/mod.rs::is_claude_hook_command`, `registry.rs::search_uses_pattern_file`,
+/// `main.rs`'s `rtk proxy '...'` arg-splitting). Built on `tokenize()` +
+/// `coalesce_words` for the splitting decision, `resolve_word_text` for the
+/// text transform — no bespoke scanning of its own.
+///
+/// Note: unlike this function's previous implementation, word boundaries now
+/// come from the shared `is_word_boundary_whitespace` (bash's real default
+/// `$IFS`: space/tab/**newline**), not just literal space/tab — so an
+/// embedded unquoted `\n` is now correctly treated as a word boundary too,
+/// matching real shell behavior instead of being glued into the word.
+pub fn shell_split(input: &str) -> Vec<String> {
+    coalesce_words(input, &tokenize(input))
+        .into_iter()
+        .map(|(raw, _)| resolve_word_text(raw))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1252,6 +1278,28 @@ mod tests {
     #[test]
     fn test_shell_split_multiple_spaces() {
         assert_eq!(shell_split("a   b   c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_shell_split_coalesces_unquoted_glob_next_to_quoted_segment() {
+        // An unquoted metacharacter directly adjacent to a quoted segment
+        // (no space between them) must stay one word — the same
+        // token-coalescing gap that split_token_spans needed for golangci-lint,
+        // now exercised through shell_split's output shape (quotes stripped).
+        assert_eq!(
+            shell_split(r#"echo *.yml"quoted end""#),
+            vec!["echo", "*.ymlquoted end"]
+        );
+    }
+
+    #[test]
+    fn test_shell_split_splits_on_embedded_newline() {
+        // Bash's default $IFS is space/tab/newline. Building shell_split on
+        // the shared is_word_boundary_whitespace (rather than its previous
+        // bespoke ' '|'\t'-only check) means an embedded unquoted `\n` is now
+        // correctly treated as a word boundary too, matching real shell
+        // behavior instead of being glued into the surrounding word.
+        assert_eq!(shell_split("a\nb"), vec!["a", "b"]);
     }
 
     #[test]
