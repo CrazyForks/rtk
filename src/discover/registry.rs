@@ -427,12 +427,8 @@ fn golangci_flag_takes_separate_value(arg: &str, flag: &str) -> bool {
 }
 
 /// Quote-aware word splitting for golangci-lint's flag/value parsing: "was
-/// there a space here", not shell syntax — deliberately not the full
-/// `tokenize()` output, since an unquoted glob like `*.yml` must stay one
-/// word rather than split on `*` the way shell-operator tokenizing would.
-/// Built directly on `tokenize()` + `coalesce_words` (merging any tokens the
-/// full tokenizer split apart but that sit with no gap between them), so this
-/// runs no bespoke scanning of its own.
+/// there a space here", not shell syntax — an unquoted glob like `*.yml`
+/// must stay one word rather than split on `*`.
 fn split_token_spans(cmd: &str) -> Vec<(&str, usize)> {
     coalesce_words(cmd, &tokenize(cmd))
 }
@@ -1027,20 +1023,11 @@ fn rewrite_pipeline_final_stage(
     })
 }
 
-/// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each segment.
-///
-/// This walk is the third of three compound-command segmenters in this
-/// codebase — see the comparison table on
-/// [`crate::discover::lexer::split_for_permissions`] (the permission gate's
-/// segmenter) for the full picture. This one also splits on background `&`
-/// (`TokenKind::Shellism if tok.value == "&"` below), but — unlike
-/// `split_for_permissions` — does **not** treat standalone `(`/`)` as a
-/// segment boundary (only bails out entirely via `has_opaque_grouping` when a
-/// pipe and a grouping char coexist) and does not truncate segments at a
-/// redirect (redirects are preserved verbatim in the rewritten output, by
-/// design). These differences are deliberate: the permission gate must stay
-/// the most conservative of the three, this function's job is to reproduce
-/// the command's actual shape, not to defend against it hiding something.
+/// Rewrite a compound command (with `&&`, `||`, `;`, `|`) by rewriting each
+/// segment. Third of three compound-command segmenters — see the comparison
+/// table on [`crate::discover::lexer::split_for_permissions`]. Deliberately
+/// less conservative than that gate: standalone `(`/`)` isn't a segment
+/// boundary, and redirects are preserved verbatim rather than truncated.
 fn rewrite_compound(
     cmd: &str,
     excluded: &[ExcludePattern],
@@ -3834,7 +3821,7 @@ mod tests {
         // Shellism token even outside quotes, splitting "*.yml" into "*" and
         // ".yml" and desyncing the flag-value-skip loop, which then reads
         // ".yml" where it expects "run" and misclassifies the whole command as
-        // Unsupported. Caught by /code-review high.
+        // Unsupported.
         assert!(matches!(
             classify_command("golangci-lint --config *.yml run ./..."),
             Classification::Supported {

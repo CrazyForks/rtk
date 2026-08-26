@@ -22,24 +22,33 @@ pub struct ParsedToken {
     pub offset: usize,
 }
 
+/// How `tokenize_inner` treats `\n`/`\r`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewlineMode {
+    /// Ordinary characters, no Operator tokens.
+    None,
+    /// `\n`, and the `\r` of a CRLF pair, are Operator boundaries; a lone
+    /// `\r` stays glued to its word — real bash's behavior.
+    Bash,
+    /// Like `Bash`, but a lone `\r` is a boundary too. Only
+    /// `split_for_permissions` uses this, to stay maximally conservative.
+    Conservative,
+}
+
 pub fn tokenize(input: &str) -> Vec<ParsedToken> {
-    tokenize_inner(input, false)
+    tokenize_inner(input, NewlineMode::None)
 }
 
 /// Like [`tokenize`] but emits a `\n` operator token for each newline that
 /// sits outside quotes. Newlines inside quoted strings stay part of their
 /// argument, so callers can use the emitted offsets as safe line-split points.
 pub fn tokenize_with_newlines(input: &str) -> Vec<ParsedToken> {
-    tokenize_inner(input, true)
+    tokenize_inner(input, NewlineMode::Bash)
 }
 
-/// Applies one character's effect on quote state, mirroring bash: an
-/// unescaped `'` or `"` opens a quote span if none is open, and only the same
-/// character closes it (a `"` inside a `'...'` span, or vice versa, is just
-/// literal text). Shared by the char-based tokenizer (`tokenize_inner`,
-/// `shell_split`) and every byte-based line scanner in `registry.rs`
-/// (`QuoteScan`), so the different representations of "am I inside a quote"
-/// can't independently drift the way they had before this was extracted.
+/// Applies one character's effect on quote state, mirroring bash: only the
+/// quote char that opened a span closes it. Shared by `tokenize_inner`,
+/// `shell_split`, and `registry.rs::QuoteScan` so they can't drift.
 pub(crate) fn advance_quote_state(quote: Option<char>, c: char) -> Option<char> {
     match (quote, c) {
         (None, '\'' | '"') => Some(c),
@@ -48,44 +57,23 @@ pub(crate) fn advance_quote_state(quote: Option<char>, c: char) -> Option<char> 
     }
 }
 
-/// Bash's default `$IFS` is space/tab/newline — never a bare `\r`. Shared by
-/// the lexer's own word-splitting and by permission-pattern normalization
-/// (`permissions.rs::command_matches_pattern`) so the two can't independently
-/// diverge on what counts as whitespace, which is how a lone-CR bug fixed here
-/// once reappeared there as a separate, undetected regression.
+/// Bash's default `$IFS` is exactly space/tab/newline — not Rust's
+/// `char::is_whitespace()`, which wrongly includes non-IFS Unicode
+/// whitespace like NBSP. Shared with `permissions.rs::command_matches_pattern`.
 pub(crate) fn is_word_boundary_whitespace(c: char) -> bool {
-    c.is_whitespace() && c != '\r'
+    matches!(c, ' ' | '\t' | '\n')
 }
 
-/// True if the byte at `i` is a `\r` immediately followed by `\n` — the two
-/// bytes of a CRLF pair. Shared by `tokenize_inner`'s newline-operator arm and
-/// `registry.rs::rewrite_multiline_block`'s raw-newline-byte parity check, so
-/// the two can't independently drift on what counts as a CRLF pair the way
-/// they had before this was extracted (flagged during the PR #3600 review
-/// that prompted this consolidation: registry.rs's `raw_breaks` re-derived
-/// this exact rule via its own byte scan instead of sharing it).
+/// True if `bytes[i..]` starts a CRLF pair. Shared by `tokenize_inner` and
+/// `registry.rs::rewrite_multiline_block`'s raw-newline parity check.
 pub(crate) fn is_crlf_at(bytes: &[u8], i: usize) -> bool {
     bytes.get(i) == Some(&b'\r') && bytes.get(i + 1) == Some(&b'\n')
 }
 
-/// Merges lexer tokens that are directly adjacent in `cmd` (no whitespace or
-/// other gap between them) into single words — the gap between "one lexer
-/// token" and "one bash word": `tokenize()` splits `*.yml` into a
-/// `Shellism("*")` and an `Arg(".yml")` for shell-syntax purposes, but bash
-/// sees one word since nothing separates them. Callers that only need
-/// "was there a space here" (not full shell-operator awareness) build on
-/// this instead of re-scanning `cmd` themselves.
-///
-/// Callers only use each `ParsedToken`'s `offset`/`value.len()` here — the
-/// `String` `tokenize()` heap-allocates per token is discarded once that's
-/// read, since the returned words are re-sliced straight from `cmd`. Not
-/// worth avoiding: this runs once per single command-line-length input, well
-/// inside RTK's <10ms/<5MB targets — a handful of short-lived allocations for
-/// maybe a dozen tokens, not a hot loop. Trading the shared `tokenize()` call
-/// for a second, offset-only scanning primitive to dodge them would resurrect
-/// the exact "one more parallel implementation" problem this consolidation
-/// exists to remove, for a gain nothing here actually needs (confirmed via
-/// `/code-review high`, which flagged this and rated it not worth fixing).
+/// Merges `tokenize()` tokens that are directly adjacent in `cmd` (no gap)
+/// into single words — e.g. `*.yml` tokenizes as `Shellism("*")` +
+/// `Arg(".yml")` but is one bash word. For callers that only need "was there
+/// a space here", not full shell-operator awareness.
 pub(crate) fn coalesce_words<'a>(cmd: &'a str, tokens: &[ParsedToken]) -> Vec<(&'a str, usize)> {
     let mut words = Vec::new();
     let mut run_start: Option<usize> = None;
@@ -109,7 +97,7 @@ pub(crate) fn coalesce_words<'a>(cmd: &'a str, tokens: &[ParsedToken]) -> Vec<(&
     words
 }
 
-fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
+fn tokenize_inner(input: &str, newline_mode: NewlineMode) -> Vec<ParsedToken> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut current_start: usize = 0;
@@ -321,14 +309,11 @@ fn tokenize_inner(input: &str, emit_newline: bool) -> Vec<ParsedToken> {
                 });
                 current_start = byte_pos;
             }
-            // `\n`, and the `\r` of a CRLF pair, are command separators. A lone `\r`
-            // (classic-Mac EOL, not followed by `\n`) is NOT: bash treats a bare CR
-            // as an ordinary character inside a word — `git status<CR>git log` runs
-            // as a single command — so gating on it would over-segment and the
-            // rewriter would mis-join it. A lone `\r` falls through to the `_` arm
-            // below like any other non-IFS byte, never a word or command boundary.
             c @ ('\n' | '\r')
-                if emit_newline && (c == '\n' || is_crlf_at(input.as_bytes(), byte_pos)) =>
+                if newline_mode != NewlineMode::None
+                    && (c == '\n'
+                        || newline_mode == NewlineMode::Conservative
+                        || is_crlf_at(input.as_bytes(), byte_pos)) =>
             {
                 flush_arg(&mut tokens, &mut current, current_start);
                 tokens.push(ParsedToken {
@@ -444,11 +429,13 @@ fn redirect_has_file_target(tokens: &[ParsedToken], i: usize) -> bool {
 /// | background `&` | splits (Shellism boundary) | does not split | splits |
 /// | `( ... )` grouping | splits (Shellism boundary) | does not split | does not split standalone |
 /// | trailing redirect | truncates the segment | kept | kept (rewritten output preserves it) |
+/// | lone `\r` (no following `\n`) | splits | does not split | does not split |
 ///
-/// Like [`split_on_operators`] but also breaks on newline, background `&`, and
-/// subshell `( ... )`, and truncates each segment at its first redirect —
-/// deliberately conservative so a hidden command can't evade the gate by
-/// hiding behind a construct another segmenter would leave intact.
+/// Like [`split_on_operators`] but also breaks on newline, background `&`,
+/// subshell `( ... )`, and a lone `\r` (`NewlineMode::Conservative`), and
+/// truncates each segment at its first redirect — deliberately conservative
+/// so a hidden command can't evade the gate by hiding behind a construct
+/// another segmenter would leave intact.
 /// Callers must still gate on [`contains_unattestable_construct`] first.
 pub fn split_for_permissions(cmd: &str) -> Vec<&str> {
     let trimmed = cmd.trim();
@@ -456,7 +443,7 @@ pub fn split_for_permissions(cmd: &str) -> Vec<&str> {
         return vec![];
     }
 
-    let tokens = tokenize_inner(trimmed, true);
+    let tokens = tokenize_inner(trimmed, NewlineMode::Conservative);
     let mut results = Vec::new();
     let mut seg_start: usize = 0;
     let mut seg_end: Option<usize> = None;
@@ -489,22 +476,15 @@ pub fn split_for_permissions(cmd: &str) -> Vec<&str> {
     results
 }
 
-/// Split a shell command on operators (`&&`, `||`, `;`) and optionally pipes (`|`),
-/// respecting quoted strings via the lexer.
+/// Split a shell command on operators (`&&`, `||`, `;`) and optionally pipes
+/// (`|`), quote-aware. `stop_at_pipe: true` returns only segments before the
+/// first `|` (rewrite's left-side-only case); `false` splits through pipes
+/// too (permission checking, every segment validated).
 ///
-/// When `stop_at_pipe` is true, returns only segments before the first `|`
-/// (used by command rewriting — only the left side of a pipe gets rewritten).
-/// When false, splits through pipes too (used by permission checking —
-/// every segment must be validated).
-///
-/// Its only current caller (`registry.rs::split_command_chain`, used for
-/// analytics/discovery classification) passes `stop_at_pipe: true`, and unlike
-/// [`split_for_permissions`] never splits on background `&` or `( ... )`
-/// grouping, and never truncates at a redirect — see the comparison table on
-/// [`split_for_permissions`] for the full picture across all three
-/// compound-command segmenters. That's fine for classification (it only needs
-/// to identify supported commands, not defend against a hidden one), but this
-/// function must not be repurposed for permission/security decisions as-is.
+/// For classification only — unlike [`split_for_permissions`] this never
+/// splits on background `&`/`( ... )` or truncates at a redirect (see that
+/// function's comparison table), so it must not be repurposed for
+/// permission/security decisions.
 pub fn split_on_operators(cmd: &str, stop_at_pipe: bool) -> Vec<&str> {
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
@@ -558,13 +538,9 @@ pub fn strip_quotes(s: &str) -> String {
     s.to_string()
 }
 
-/// Turns one coalesced word's raw text (quotes and backslash escapes still
-/// literal, exactly as `tokenize()` preserves them) into the argv-ready text
-/// `shell_split`'s callers need: quote characters that actually open/close a
-/// span are stripped, backslash escapes are resolved (dropped, keeping the
-/// escaped character). The inverse of what `tokenize_inner` preserves — built
-/// on the same `advance_quote_state` so it can't drift from the tokenizer's
-/// own quote model.
+/// Turns a coalesced word's raw text (quotes/escapes still literal, as
+/// `tokenize()` preserves them) into argv-ready text: quote chars that
+/// open/close a span are stripped, backslash escapes resolved.
 fn resolve_word_text(raw: &str) -> String {
     let mut result = String::new();
     let mut chars = raw.chars().peekable();
@@ -598,16 +574,7 @@ fn resolve_word_text(raw: &str) -> String {
 /// Quote-aware split of a single shell command into argv-ready words: quotes
 /// stripped, backslash escapes resolved — for callers that hand the result
 /// straight to `Command::new`/exec or compare it against literal words
-/// (`hooks/mod.rs::is_claude_hook_command`, `registry.rs::search_uses_pattern_file`,
-/// `main.rs`'s `rtk proxy '...'` arg-splitting). Built on `tokenize()` +
-/// `coalesce_words` for the splitting decision, `resolve_word_text` for the
-/// text transform — no bespoke scanning of its own.
-///
-/// Note: unlike this function's previous implementation, word boundaries now
-/// come from the shared `is_word_boundary_whitespace` (bash's real default
-/// `$IFS`: space/tab/**newline**), not just literal space/tab — so an
-/// embedded unquoted `\n` is now correctly treated as a word boundary too,
-/// matching real shell behavior instead of being glued into the word.
+/// (`hooks/mod.rs::is_claude_hook_command`, `rtk proxy` arg-splitting).
 pub fn shell_split(input: &str) -> Vec<String> {
     coalesce_words(input, &tokenize(input))
         .into_iter()
@@ -1294,12 +1261,17 @@ mod tests {
 
     #[test]
     fn test_shell_split_splits_on_embedded_newline() {
-        // Bash's default $IFS is space/tab/newline. Building shell_split on
-        // the shared is_word_boundary_whitespace (rather than its previous
-        // bespoke ' '|'\t'-only check) means an embedded unquoted `\n` is now
-        // correctly treated as a word boundary too, matching real shell
-        // behavior instead of being glued into the surrounding word.
+        // Bash's default $IFS is space/tab/newline, so an embedded unquoted
+        // `\n` is a word boundary, same as space or tab.
         assert_eq!(shell_split("a\nb"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_shell_split_does_not_split_on_nbsp() {
+        // U+00A0 (NBSP) has Unicode `White_Space = Y` despite not being part
+        // of bash's $IFS — char::is_whitespace() would wrongly treat it as a
+        // word boundary. `a\u{a0}b` must stay one word, matching real bash.
+        assert_eq!(shell_split("a\u{a0}b"), vec!["a\u{a0}b"]);
     }
 
     #[test]
@@ -1471,6 +1443,27 @@ mod tests {
     }
 
     #[test]
+    fn test_split_perms_lone_cr_still_splits() {
+        assert_eq!(
+            split_for_permissions("git status\rrm -rf ~"),
+            vec!["git status", "rm -rf ~"]
+        );
+        // A CRLF pair still splits exactly once, not twice.
+        assert_eq!(
+            split_for_permissions("git status\r\ncargo build"),
+            vec!["git status", "cargo build"]
+        );
+    }
+
+    #[test]
+    fn test_split_perms_lone_cr_inside_quotes_not_split() {
+        assert_eq!(
+            split_for_permissions("echo 'foo\rbar'"),
+            vec!["echo 'foo\rbar'"]
+        );
+    }
+
+    #[test]
     fn test_split_perms_background_ampersand() {
         assert_eq!(
             split_for_permissions("git status & rm -rf ~"),
@@ -1540,10 +1533,6 @@ mod tests {
 
     #[test]
     fn test_crlf_in_plain_tokenize_keeps_cr_glued_to_word() {
-        // Plain `tokenize()` (emit_newline=false) treats `\n` as ordinary IFS
-        // whitespace but never `\r` — a `\r` right before it is not a separator,
-        // so it stays glued to the word it terminates, same as real bash would
-        // keep a bare CR byte attached to its word.
         let args: Vec<String> = tokenize("git status\r\ngit log")
             .into_iter()
             .map(|t| t.value)

@@ -383,10 +383,8 @@ pub(crate) fn extract_bash_pattern(rule: &str) -> &str {
 /// - `* suffix`, `pre * suf` → glob matching where `*` matches any sequence of characters
 /// - `pattern` → exact match or prefix match (cmd must equal pattern or start with `{pattern} `)
 pub(crate) fn command_matches_pattern(cmd: &str, pattern: &str) -> bool {
-    // Shares the lexer's definition of a word boundary (`is_word_boundary_whitespace`)
-    // instead of `str::split_whitespace()`'s Unicode-whitespace notion, so a bare
-    // `\r` embedded in `cmd` is never collapsed into a space here — matching how
-    // the lexer itself now treats a lone `\r` as part of the word, not a boundary.
+    // Shares the lexer's word-boundary definition rather than
+    // str::split_whitespace(), so a bare `\r` in `cmd` never collapses into a space.
     let normalize = |s: &str| {
         s.split(is_word_boundary_whitespace)
             .filter(|part| !part.is_empty())
@@ -958,12 +956,6 @@ mod tests {
 
     #[test]
     fn test_lone_cr_hidden_command_not_auto_allowed() {
-        // `split_for_permissions` correctly treats a lone `\r` (no `\n`) as part
-        // of one command, not a boundary. Before command_matches_pattern shared
-        // the lexer's word-boundary definition, its own `split_whitespace()`
-        // still collapsed the embedded `\r` into a space, so "git status\rrm -rf
-        // ~" normalized to "git status rm -rf ~" and matched an allow rule for
-        // "git status" it should never have matched.
         let allow = vec!["git status".to_string()];
         assert_eq!(
             check_command_with_rules("git status\rrm -rf ~", &[], &[], &allow),
@@ -977,6 +969,15 @@ mod tests {
             "git status\rrm -rf ~",
             "git status"
         ));
+    }
+
+    #[test]
+    fn test_lone_cr_segment_still_denied() {
+        let deny = vec!["rm:*".to_string()];
+        assert_eq!(
+            check_command_with_rules("git status\rrm -rf ~", &deny, &[], &[]),
+            PermissionVerdict::Deny
+        );
     }
 
     #[test]
