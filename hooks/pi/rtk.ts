@@ -39,33 +39,52 @@ async function rewriteCommand(
   return result.stdout.trim() || null
 }
 
-// Persistent "RTK disabled" notice for runtimes that expose one. OMP's
-// legacy-pi-compat provides ctx.ui.setStatus on session_start; on Pi the
-// callback simply never fires (a strict on() implementation is caught below).
+type StatusContext = {
+  ui?: {
+    setStatus?: (key: string, text: string) => void
+  }
+}
+
+// Register before the async version probe so a host cannot miss the handler
+// while the probe is in flight. If session_start happens first, retain its
+// context and apply the status as soon as the probe reports a failure.
 // pi.notify is intentionally not used — OMP wipes it on the initial render.
-function notifyRtkUnavailable(pi: ExtensionAPI, reason: string) {
+function registerRtkUnavailableNotice(pi: ExtensionAPI) {
+  let reason: string | undefined
+  let sessionContext: StatusContext | undefined
+
+  const applyStatus = () => {
+    if (!reason || !sessionContext) return
+    try {
+      sessionContext.ui?.setStatus?.("rtk", `RTK disabled: ${reason}`)
+    } catch {
+      // Status reporting must never affect the extension's fail-open behavior.
+    }
+  }
+
   try {
     pi.on("session_start", (_event: unknown, ctx: unknown) => {
-      (ctx as { ui?: { setStatus?: (key: string, text: string) => void } })?.ui?.setStatus?.(
-        "rtk",
-        `RTK disabled: ${reason}`
-      )
+      sessionContext = ctx as StatusContext
+      applyStatus()
     })
   } catch {
     // Runtimes without a session_start event: nothing to report.
+    return (_reason: string) => {}
+  }
+
+  return (nextReason: string) => {
+    reason = nextReason
+    applyStatus()
   }
 }
 
 export default async function (pi: ExtensionAPI) {
-  // OMP surfaces extension labels in the session UI; Pi has no setLabel (no-op there).
-  if (typeof (pi as { setLabel?: (label: string) => void }).setLabel === "function") {
-    (pi as { setLabel?: (label: string) => void }).setLabel("RTK")
-  }
+  const reportRtkUnavailable = registerRtkUnavailableNotice(pi)
 
   // Probe rtk version at load time; disables extension if missing or too old.
   const ver = await pi.exec("rtk", ["--version"], { timeout: REWRITE_TIMEOUT_MS })
   if (ver.code !== 0) {
-    notifyRtkUnavailable(pi, "rtk binary not found in PATH")
+    reportRtkUnavailable("rtk binary not found in PATH")
     console.warn("[rtk] rtk binary not found in PATH — extension disabled")
     return
   }
@@ -75,7 +94,7 @@ export default async function (pi: ExtensionAPI) {
   if (parsed) {
     const [major, minor] = parsed
     if (major === 0 && minor < MIN_SUPPORTED_RTK_MINOR) {
-      notifyRtkUnavailable(pi, `rtk ${parsed.join(".")} is too old (need >= 0.23.0)`)
+      reportRtkUnavailable(`rtk ${parsed.join(".")} is too old (need >= 0.23.0)`)
       console.warn(`[rtk] rtk ${ver.stdout.trim()} is too old (need >= 0.23.0) — extension disabled`)
       return
     }
