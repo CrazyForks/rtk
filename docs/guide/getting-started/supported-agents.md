@@ -112,7 +112,9 @@ rtk init --agent pi
 rtk init --agent pi --global
 ```
 
-Creates `.pi/extensions/rtk.ts` (local) or `~/.pi/agent/extensions/rtk.ts` (global). Pi auto-discovers extensions from both paths on startup.
+Creates `.pi/extensions/rtk.ts` (local) or `~/.pi/agent/extensions/rtk.ts` (global). Pi auto-discovers extensions from both paths on startup. The global path follows `PI_CODING_AGENT_DIR` when set.
+
+Installation updates only the current or a known historical RTK extension. If the managed path contains a modified or unrelated file, RTK refuses to overwrite it; remove or back it up manually before retrying.
 
 Uninstall:
 
@@ -121,7 +123,7 @@ rtk init --uninstall --agent pi
 rtk init --uninstall --agent pi --global
 ```
 
-Removes only the installed Pi extension file.
+Removes only the current or known historical stock Pi extension. If the file contains modified RTK content, uninstall aborts without deleting it; unrelated content is left in place.
 
 ### Oh My Pi (OMP)
 
@@ -133,7 +135,9 @@ rtk init --agent omp
 rtk init --agent omp --global
 ```
 
-Creates `.omp/extensions/rtk.ts` (local) or `~/.omp/agent/extensions/rtk.ts` (global). OMP loads the same extension file as Pi through its `legacy-pi-compat` layer, so both agents share `rtk.ts`.
+Creates `.omp/extensions/rtk.ts` (local) or `~/.omp/agent/extensions/rtk.ts` (global). OMP loads the same extension file as Pi through its `legacy-pi-compat` layer, so both agents share `rtk.ts`. The global path follows `PI_CODING_AGENT_DIR`, which OMP also honors for its agent directory.
+
+Installation updates only the current or a known historical RTK extension. If the managed path contains a modified or unrelated file, RTK refuses to overwrite it; remove or back it up manually before retrying.
 
 Uninstall:
 
@@ -142,7 +146,7 @@ rtk init --uninstall --agent omp
 rtk init --uninstall --agent omp --global
 ```
 
-Removes only the installed OMP extension file. If the file has been modified after install, uninstall aborts with a message instead of removing it.
+Removes only the current or known historical stock OMP extension. If the file has been modified after install, uninstall aborts with a message instead of removing it; unrelated content is left in place.
 
 ### OpenClaw
 

@@ -19,7 +19,10 @@ with other Pi extensions.
 - Calls `rtk rewrite` via `pi.exec`; mutates `event.input.command` in-place if rewrite differs
 - All error paths return `undefined` (pass through); RTK never blocks execution
 - Version guard at load time: checks `rtk >= 0.23.0`; warns and registers no-op if too old or missing
+- Install updates only current or known historical stock content; it refuses to overwrite a modified or unrelated file at the managed path
 - Installed to `.pi/extensions/rtk.ts` by `rtk init --agent pi` (project-local) or `~/.pi/agent/extensions/rtk.ts` by `rtk init --agent pi --global`
+
+The same extension is shared with Oh My Pi (OMP) through OMP's `legacy-pi-compat` layer. OMP installs it at `.omp/extensions/rtk.ts` (project-local) or `~/.omp/agent/extensions/rtk.ts` (global). The global OMP path follows `PI_CODING_AGENT_DIR`, which OMP also honors.
 
 ## Uninstall
 
@@ -33,8 +36,7 @@ rtk init --uninstall --agent pi --global
 # → removes ~/.pi/agent/extensions/rtk.ts
 ```
 
-Uninstall is idempotent — re-running when nothing is installed is a no-op.
-Only the extension file is managed by install/uninstall.
+Uninstalling an absent extension is a no-op. Current and known historical stock files are removed, while modified RTK content is preserved and causes uninstall to fail with a manual-removal message. Unrelated content is left alone. Only the extension file is managed by install/uninstall.
 
 ## Testing
 

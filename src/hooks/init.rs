@@ -31,18 +31,22 @@ const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode/rtk.ts");
 // Embedded Pi extension (auto-rewrite)
 const PI_PLUGIN: &str = include_str!("../../hooks/pi/rtk.ts");
 
-// SHA-256 hashes of the stock Pi extension revisions shipped before the
-// current embedded file. Keep these when changing the extension so an
-// untouched older install can still be removed safely. Hashes are computed
-// after trimming trailing whitespace, matching the current comparison below.
-// Revisions: 1da5793, a7cab79, 9bd6e6f, 8bc8b46, f6a5451, 4c72946.
+// SHA-256 hashes of stock Pi extension revisions that may exist on user
+// machines, including the current embedded file. Keep historical entries
+// when changing the extension so an untouched older install can still be
+// removed safely. Hashes are computed after trimming trailing whitespace,
+// matching the current comparison below.
+// Revisions: current (12a7cf0), 1da5793, a7cab79, 9bd6e6f, 8bc8b46,
+// f6a5451, 3e7d02d, and fb61481.
 const KNOWN_PI_PLUGIN_HASHES: &[&str] = &[
+    "5e80e811e689adc9d5ae5a59d1d5702060ca0c10320fea7cffd83c659026f1c5",
     "b63e3f6eeaeec23837df5a7c4024fe16dca1f8a49fb1743f8a877cc136ebc2d9",
     "c30d4f4774c59bf25b50b70ab8a7dcb1b8287074592af1598dc09962fa1c7137",
     "5ad230679294dc8dce09546fa25101fd3d0949f454cc8b72e04664fa1bd45ed7",
     "be251e44747e6d09e5ca56ecaeddd8f4861c35a57500cd8b2bf9c39afe5795e8",
     "eb56dd08b8d5f4704906d037d70b357d84d827abe1063135cc7c998efe6cf7f2",
-    "2cbb2a7a9081275d6eda140d9e375f6772b5c354e7fe931c554c371ad8836c6e",
+    "628308173ae41c488b76bcf90eafbd4c0c72435927645d81cdbec652eac4b107",
+    "3eb16108f51a29c2a62a453d5c97a6ea2da8aea1061da34c50fdcfaa32dc0ff7",
 ];
 
 // Embedded slim RTK awareness instructions
@@ -3418,7 +3422,26 @@ fn pi_plugin_path_for_scope(global: bool) -> Result<PathBuf> {
 
 /// Write the Pi extension file if missing or outdated. Returns true if written.
 fn ensure_pi_plugin_installed(path: &Path, ctx: InitContext) -> Result<bool> {
-    write_if_changed(path, PI_PLUGIN, "Pi extension", ctx)
+    write_stock_pi_plugin_if_changed(path, "Pi extension", ctx)
+}
+
+/// Write a managed Pi-compatible extension only when the existing file is
+/// current or a known stock revision. Refuse to overwrite user or third-party
+/// content at the managed path.
+fn write_stock_pi_plugin_if_changed(path: &Path, name: &str, ctx: InitContext) -> Result<bool> {
+    if path.exists() {
+        let existing = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}: {}", name, path.display()))?;
+        if !is_known_stock_pi_plugin(&existing) {
+            anyhow::bail!(
+                "{} at {} is not a known stock RTK extension; refusing to overwrite it. Remove or back up the file manually before retrying.",
+                name,
+                path.display()
+            );
+        }
+    }
+
+    write_if_changed(path, PI_PLUGIN, name, ctx)
 }
 
 fn is_current_pi_plugin(content: &str) -> bool {
@@ -3621,7 +3644,7 @@ fn remove_opencode_plugin(ctx: InitContext) -> Result<Vec<PathBuf>> {
 /// Return the OMP extension install path for the given scope.
 fn omp_extension_path_for_scope(global: bool) -> Result<PathBuf> {
     if global {
-        Ok(resolve_home_subdir(OMP_DIR)?
+        Ok(resolve_omp_dir()?
             .join(PI_EXTENSIONS_SUBDIR)
             .join(PI_PLUGIN_FILE))
     } else {
@@ -3629,6 +3652,18 @@ fn omp_extension_path_for_scope(global: bool) -> Result<PathBuf> {
             .join(PI_EXTENSIONS_SUBDIR)
             .join(PI_PLUGIN_FILE))
     }
+}
+
+/// Resolve OMP's global agent directory. OMP itself uses
+/// `PI_CODING_AGENT_DIR` for this relocation, so RTK follows the same
+/// override instead of introducing a second path configuration.
+fn resolve_omp_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var(PI_CODING_AGENT_DIR_ENV) {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    resolve_home_subdir(OMP_DIR)
 }
 
 /// Install the shared Pi extension file for OMP (hook-only; no AGENTS.md
@@ -3654,7 +3689,7 @@ pub fn run_omp_mode(global: bool, ctx: InitContext) -> Result<()> {
         )?;
     }
 
-    let installed = write_if_changed(path.as_path(), PI_PLUGIN, "OMP extension", ctx)?;
+    let installed = write_stock_pi_plugin_if_changed(path.as_path(), "OMP extension", ctx)?;
 
     if dry_run {
         print_dry_run_footer();
@@ -3688,7 +3723,11 @@ pub fn uninstall_omp(global: bool, ctx: InitContext) -> Result<()> {
     let path = omp_extension_path_for_scope(global)?;
 
     if !path.exists() {
-        println!("RTK OMP extension was not installed (nothing to remove)");
+        if dry_run {
+            print_dry_run_footer();
+        } else {
+            println!("RTK OMP extension was not installed (nothing to remove)");
+        }
         return Ok(());
     }
 
@@ -3718,6 +3757,9 @@ pub fn uninstall_omp(global: bool, ctx: InitContext) -> Result<()> {
             "OMP extension at {} is not RTK content; leaving it alone.",
             path.display()
         );
+        if dry_run {
+            print_dry_run_footer();
+        }
     }
 
     Ok(())
@@ -7407,6 +7449,21 @@ mod tests {
         }
     }
 
+    fn with_omp_dir_override<F: FnOnce(&Path)>(tmp: &TempDir, f: F) {
+        // OMP reuses PI_CODING_AGENT_DIR, so share the Pi environment lock.
+        let _guard = PI_DIR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let omp_dir = tmp.path().join("omp_agent");
+        fs::create_dir_all(&omp_dir).unwrap();
+
+        let orig = std::env::var_os(PI_CODING_AGENT_DIR_ENV);
+        std::env::set_var(PI_CODING_AGENT_DIR_ENV, &omp_dir);
+        f(&omp_dir);
+        match orig {
+            Some(v) => std::env::set_var(PI_CODING_AGENT_DIR_ENV, v),
+            None => std::env::remove_var(PI_CODING_AGENT_DIR_ENV),
+        }
+    }
+
     #[test]
     fn test_global_default_mode_creates_artifacts() {
         let tmp = TempDir::new().unwrap();
@@ -7758,6 +7815,31 @@ mod tests {
     }
 
     #[test]
+    fn test_pi_install_refuses_modified_extension() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(PI_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        let modified = "// user-modified extension\nexport default () => {}\n";
+        fs::write(&path, modified).unwrap();
+
+        let result = run_pi_mode(false, InitContext::default());
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), modified);
+    }
+
+    #[test]
     fn test_run_pi_mode_global_does_not_create_agents_md() {
         let tmp = TempDir::new().unwrap();
         with_pi_dir_override(&tmp, |pi_dir| {
@@ -8050,10 +8132,15 @@ mod tests {
 
     #[test]
     fn test_known_pi_plugin_hashes_are_sha256() {
-        assert_eq!(KNOWN_PI_PLUGIN_HASHES.len(), 6);
         assert!(KNOWN_PI_PLUGIN_HASHES
             .iter()
             .all(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())));
+
+        let current_hash = integrity::compute_hash_bytes(PI_PLUGIN.trim_end().as_bytes());
+        assert!(
+            KNOWN_PI_PLUGIN_HASHES.contains(&current_hash.as_str()),
+            "current Pi extension hash {current_hash} is missing from KNOWN_PI_PLUGIN_HASHES"
+        );
         assert!(is_known_stock_pi_plugin(PI_PLUGIN));
 
         let modified = format!("{}\n// user modification\n", PI_PLUGIN);
@@ -8074,15 +8161,38 @@ mod tests {
     }
 
     #[test]
-    fn test_omp_extension_path_for_scope_global() {
-        let path = omp_extension_path_for_scope(true).unwrap();
-        assert!(path.is_absolute());
-        assert!(
-            path.to_string_lossy().contains(OMP_DIR),
-            "unexpected global OMP path: {}",
-            path.display()
-        );
-        assert!(path.ends_with("extensions/rtk.ts"));
+    fn test_omp_extension_path_for_scope_global_honours_pi_dir_override() {
+        let tmp = TempDir::new().unwrap();
+        with_omp_dir_override(&tmp, |omp_dir| {
+            let path = omp_extension_path_for_scope(true).unwrap();
+            assert_eq!(
+                path,
+                omp_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE)
+            );
+        });
+    }
+
+    #[test]
+    fn test_omp_global_install_and_uninstall_use_override() {
+        let tmp = TempDir::new().unwrap();
+        with_omp_dir_override(&tmp, |omp_dir| {
+            run_omp_mode(true, InitContext::default()).unwrap();
+
+            let plugin = omp_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
+            assert!(plugin.exists(), "global OMP extension must be created");
+
+            uninstall(
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                InitContext::default(),
+            )
+            .unwrap();
+            assert!(!plugin.exists(), "global OMP extension must be removed");
+        });
     }
 
     #[test]
@@ -8102,6 +8212,31 @@ mod tests {
             .join(PI_PLUGIN_FILE);
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content.trim(), PI_PLUGIN.trim());
+    }
+
+    #[test]
+    fn test_omp_install_refuses_modified_extension() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(OMP_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        let modified = "// user-modified extension\nexport default () => {}\n";
+        fs::write(&path, modified).unwrap();
+
+        let result = run_omp_mode(false, InitContext::default());
+        std::env::set_current_dir(&cwd).unwrap();
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(fs::read_to_string(path).unwrap(), modified);
     }
 
     #[test]
@@ -8235,7 +8370,7 @@ mod tests {
     }
 
     #[test]
-    fn test_omp_uninstall_unrelated_content_left_alone() {
+    fn test_omp_uninstall_unrelated_content_dry_run_left_alone() {
         let tmp = TempDir::new().unwrap();
         let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cwd = std::env::current_dir().unwrap();
@@ -8253,7 +8388,10 @@ mod tests {
             false,
             false,
             true,
-            InitContext::default(),
+            InitContext {
+                dry_run: true,
+                ..InitContext::default()
+            },
         );
         std::env::set_current_dir(&cwd).unwrap();
         result.unwrap();
@@ -8262,7 +8400,7 @@ mod tests {
     }
 
     #[test]
-    fn test_omp_uninstall_missing_is_noop() {
+    fn test_omp_uninstall_missing_dry_run_is_noop() {
         let tmp = TempDir::new().unwrap();
         let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cwd = std::env::current_dir().unwrap();
@@ -8275,7 +8413,10 @@ mod tests {
             false,
             false,
             true,
-            InitContext::default(),
+            InitContext {
+                dry_run: true,
+                ..InitContext::default()
+            },
         );
         std::env::set_current_dir(&cwd).unwrap();
         result.unwrap();
