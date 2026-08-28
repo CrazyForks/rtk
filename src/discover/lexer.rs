@@ -548,7 +548,19 @@ fn resolve_word_text(raw: &str) -> String {
 
     while let Some(c) = chars.next() {
         match c {
-            '\\' if quote != Some('\'') => {
+            // Inside double quotes bash only lets `\` escape `$`, `` ` ``, `"`,
+            // `\` or a newline; before anything else it is a literal character.
+            // That is what keeps a quoted Windows path (`"C:\Program Files"`)
+            // intact instead of eating its separators.
+            '\\' if quote == Some('"') => match chars.peek() {
+                Some('$' | '`' | '"' | '\\' | '\n') => {
+                    if let Some(next) = chars.next() {
+                        result.push(next);
+                    }
+                }
+                _ => result.push('\\'),
+            },
+            '\\' if quote.is_none() => {
                 if let Some(next) = chars.next() {
                     result.push(next);
                 }
@@ -1220,6 +1232,22 @@ mod tests {
         assert_eq!(
             shell_split(r"echo hello\ world"),
             vec!["echo", "hello world"]
+        );
+    }
+
+    #[test]
+    fn test_shell_split_keeps_backslash_in_double_quotes() {
+        assert_eq!(
+            shell_split(r#""C:\Program Files\rtk.exe" hook codex"#),
+            vec![r"C:\Program Files\rtk.exe", "hook", "codex"]
+        );
+    }
+
+    #[test]
+    fn test_shell_split_double_quote_escapes_only_bash_specials() {
+        assert_eq!(
+            shell_split(r#"echo "a\$b" "a\"b" "a\\b" "a\nb""#),
+            vec!["echo", "a$b", "a\"b", r"a\b", r"a\nb"]
         );
     }
 
