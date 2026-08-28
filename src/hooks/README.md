@@ -58,7 +58,7 @@ Controls how `rtk init` modifies agent settings files:
 |------|------|----------|
 | Ask (default) | -- | Prompts before settings changes, protected Pi/OMP overwrites, and shared uninstalls; defaults to No if stdin not terminal |
 | Auto | `--auto-patch` | Patches without prompting and approves protected Pi/OMP extension updates; for CI/scripted installs |
-| Skip | `--no-patch` | Leaves protected Pi/OMP files unchanged and exits nonzero; settings changes print manual instructions |
+| Skip | `--no-patch` | Protected Pi/OMP actions leave files unchanged and exit nonzero; settings changes print manual instructions and succeed |
 
 ## Atomicity and Safety
 

@@ -59,6 +59,17 @@ fn omp_dry_run_stock_includes_footer_and_real_uninstall_mentions_restart() {
     let project = tempfile::tempdir().unwrap();
     let agent_dir = project.path().join("omp-agent");
 
+    let pi_install = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "pi", "--global"],
+    );
+    assert!(
+        pi_install.status.success(),
+        "Pi install failed: {}",
+        stderr(&pi_install)
+    );
+
     let install = run_rtk(
         project.path(),
         &agent_dir,
@@ -221,6 +232,54 @@ fn pi_relocated_global_without_omp_does_not_warn_or_prompt() {
 }
 
 #[test]
+fn relocated_omp_ownership_is_tracked_symmetrically() {
+    let project = tempfile::tempdir().unwrap();
+    let agent_dir = project.path().join("omp-agent");
+    let extension = agent_dir.join("extensions/rtk.ts");
+    let ownership = agent_dir.join("extensions/rtk.ts.rtk-agents");
+
+    let omp_install = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "omp", "--global"],
+    );
+    assert!(
+        omp_install.status.success(),
+        "OMP global install failed: {}",
+        stderr(&omp_install)
+    );
+    assert!(!stderr(&omp_install).contains("share the global extension path"));
+    assert_eq!(std::fs::read_to_string(&ownership).unwrap(), "omp\n");
+
+    let pi_uninstall = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "pi", "--global", "--uninstall"],
+    );
+    assert!(
+        !pi_uninstall.status.success(),
+        "Pi uninstall unexpectedly removed an OMP-owned shared extension: {}",
+        stderr(&pi_uninstall)
+    );
+    assert!(stderr(&pi_uninstall).contains("share the global extension path"));
+    assert!(extension.exists());
+
+    let omp_uninstall = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "omp", "--global", "--uninstall"],
+    );
+    assert!(
+        omp_uninstall.status.success(),
+        "OMP-only uninstall failed: {}",
+        stderr(&omp_uninstall)
+    );
+    assert!(!stderr(&omp_uninstall).contains("share the global extension path"));
+    assert!(!extension.exists());
+    assert!(!ownership.exists());
+}
+
+#[test]
 fn pi_modified_uninstall_dry_run_is_non_failing_preview() {
     let project = tempfile::tempdir().unwrap();
     let agent_dir = project.path().join("pi-agent");
@@ -332,4 +391,93 @@ fn omp_show_reports_unreadable_extension_and_continues() {
     assert!(stdout(&output).contains("Global extension:"));
     assert!(stdout(&output).contains("(unreadable)"));
     assert!(stdout(&output).contains("Project extension:"));
+}
+
+#[test]
+fn omp_unreadable_install_is_recoverable_with_auto_patch() {
+    let project = TempDir::new().unwrap();
+    let agent_dir = project.path().join("omp-agent");
+    let extension_dir = agent_dir.join("extensions");
+    let extension = extension_dir.join("rtk.ts");
+    std::fs::create_dir_all(&extension_dir).unwrap();
+    let original = [0xff, 0xfe, 0xfd];
+    std::fs::write(&extension, original).unwrap();
+
+    let dry_run = run_rtk(
+        project.path(),
+        &agent_dir,
+        &[
+            "init",
+            "--agent",
+            "omp",
+            "--global",
+            "--auto-patch",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        dry_run.status.success(),
+        "OMP unreadable install dry-run failed: {}",
+        stderr(&dry_run)
+    );
+    assert!(stdout(&dry_run).contains("[dry-run] would overwrite non-stock"));
+    assert_eq!(std::fs::read(&extension).unwrap(), original);
+
+    let auto = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "omp", "--global", "--auto-patch"],
+    );
+    assert!(
+        auto.status.success(),
+        "OMP unreadable install failed: {}",
+        stderr(&auto)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&extension).unwrap(),
+        include_str!("../hooks/pi/rtk.ts")
+    );
+}
+
+#[test]
+fn omp_unreadable_uninstall_is_dry_run_preview_but_normal_failure() {
+    let project = TempDir::new().unwrap();
+    let agent_dir = project.path().join("omp-agent");
+    let extension_dir = agent_dir.join("extensions");
+    let extension = extension_dir.join("rtk.ts");
+    std::fs::create_dir_all(&extension_dir).unwrap();
+    std::fs::write(&extension, [0xff, 0xfe, 0xfd]).unwrap();
+
+    let dry_run = run_rtk(
+        project.path(),
+        &agent_dir,
+        &[
+            "init",
+            "--agent",
+            "omp",
+            "--global",
+            "--uninstall",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        dry_run.status.success(),
+        "OMP unreadable uninstall dry-run failed: {}",
+        stderr(&dry_run)
+    );
+    assert!(stdout(&dry_run).contains("[dry-run] would leave unreadable OMP extension unchanged"));
+    assert!(stdout(&dry_run).contains("[dry-run] Nothing written."));
+    assert!(extension.exists());
+
+    let uninstall = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "omp", "--global", "--uninstall"],
+    );
+    assert!(
+        !uninstall.status.success(),
+        "OMP unreadable uninstall unexpectedly succeeded"
+    );
+    assert!(stderr(&uninstall).contains("could not be read; leaving it alone"));
+    assert!(extension.exists());
 }

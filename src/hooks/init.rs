@@ -36,6 +36,7 @@ const PI_PLUGIN: &str = include_str!("../../hooks/pi/rtk.ts");
 // both the current `pi.exec` call and older stock revisions that imported
 // `exec` locally before invoking it.
 const PI_PLUGIN_REWRITE_MARKER: &str = "exec(\"rtk\", [\"rewrite\"";
+const PI_AGENT_STATE_SUFFIX: &str = ".rtk-agents";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PiCompatibleAgent {
@@ -48,6 +49,28 @@ impl PiCompatibleAgent {
         match self {
             Self::Pi => "Pi",
             Self::Omp => "OMP",
+        }
+    }
+
+    fn state_name(self) -> &'static str {
+        match self {
+            Self::Pi => "pi",
+            Self::Omp => "omp",
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Self::Pi => Self::Omp,
+            Self::Omp => Self::Pi,
+        }
+    }
+
+    fn from_state_name(name: &str) -> Option<Self> {
+        match name {
+            "pi" => Some(Self::Pi),
+            "omp" => Some(Self::Omp),
+            _ => None,
         }
     }
 }
@@ -393,10 +416,53 @@ pub fn run(
 /// Idempotent file write: create or update if content differs.
 /// When `dry_run` is true, prints the intended action and does not touch the filesystem.
 fn write_if_changed(path: &Path, content: &str, name: &str, ctx: InitContext) -> Result<bool> {
+    write_if_changed_internal(path, content, name, ctx, false)
+}
+
+/// Variant used for the Pi-compatible extension. A protected extension that
+/// cannot be decoded is still replaceable after the caller's policy allows it
+/// (for example, `--auto-patch`), so a read error is treated like differing
+/// content instead of preventing recovery.
+fn write_if_changed_allow_unreadable(
+    path: &Path,
+    content: &str,
+    name: &str,
+    ctx: InitContext,
+) -> Result<bool> {
+    write_if_changed_internal(path, content, name, ctx, true)
+}
+
+fn write_if_changed_internal(
+    path: &Path,
+    content: &str,
+    name: &str,
+    ctx: InitContext,
+    allow_unreadable: bool,
+) -> Result<bool> {
     let InitContext { verbose, dry_run } = ctx;
     if path.exists() {
-        let existing = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}: {}", name, path.display()))?;
+        let existing = match fs::read_to_string(path) {
+            Ok(existing) => existing,
+            Err(_) if allow_unreadable => {
+                if dry_run {
+                    println!("[dry-run] would update {}: {}", name, path.display());
+                    if verbose > 0 {
+                        println!("[dry-run] content:\n{}", content);
+                    }
+                } else {
+                    atomic_write(path, content)
+                        .with_context(|| format!("Failed to write {}: {}", name, path.display()))?;
+                    if verbose > 0 {
+                        eprintln!("Updated {}: {}", name, path.display());
+                    }
+                }
+                return Ok(true);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to read {}: {}", name, path.display()));
+            }
+        };
 
         if existing == content {
             if verbose > 0 {
@@ -3477,9 +3543,19 @@ fn validate_stock_pi_plugin_path(
     ctx: InitContext,
 ) -> Result<bool> {
     if path.exists() {
-        let existing = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}: {}", name, path.display()))?;
-        if !is_known_stock_pi_plugin(&existing) {
+        let is_known_stock = match fs::read_to_string(path) {
+            Ok(existing) => is_known_stock_pi_plugin(&existing),
+            Err(error) => {
+                eprintln!(
+                    "[warn] {} at {} could not be read; treating it as non-stock: {}",
+                    name,
+                    path.display(),
+                    error
+                );
+                false
+            }
+        };
+        if !is_known_stock {
             if ctx.dry_run {
                 match patch_mode {
                     PatchMode::Ask => println!(
@@ -3557,15 +3633,13 @@ fn ensure_pi_extensions_dir(parent: &Path, name: &str, ctx: InitContext) -> Resu
     Ok(())
 }
 
-/// Check whether a global Pi-compatible extension path is shared by both
-/// agents through `PI_CODING_AGENT_DIR`.
-///
-/// A relocated Pi directory alone is not evidence that OMP is installed:
-/// OMP also honors `PI_CODING_AGENT_DIR`, so the two resolved paths are equal
-/// for every relocated Pi user. Pi-side warnings/prompts therefore require
-/// an OMP config directory, while an explicit OMP operation is itself enough
-/// evidence to warn before touching the shared target.
-fn global_extension_is_shared(global: bool, path: &Path, agent: PiCompatibleAgent) -> Result<bool> {
+/// Check whether the global Pi and OMP extension paths resolve to the same
+/// target through `PI_CODING_AGENT_DIR`.
+fn global_extension_paths_alias(
+    global: bool,
+    path: &Path,
+    agent: PiCompatibleAgent,
+) -> Result<bool> {
     if !global {
         return Ok(false);
     }
@@ -3575,14 +3649,130 @@ fn global_extension_is_shared(global: bool, path: &Path, agent: PiCompatibleAgen
         PiCompatibleAgent::Omp => pi_plugin_path_for_scope(true)?,
     };
 
-    if path != other_path {
+    Ok(path == other_path)
+}
+
+fn shared_agent_state_path(path: &Path) -> PathBuf {
+    let mut state_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| OsString::from(PI_PLUGIN_FILE));
+    state_name.push(PI_AGENT_STATE_SUFFIX);
+    path.with_file_name(state_name)
+}
+
+fn read_managed_agents(path: &Path) -> Result<Option<Vec<PiCompatibleAgent>>> {
+    let state_path = shared_agent_state_path(path);
+    if !state_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&state_path).with_context(|| {
+        format!(
+            "Failed to read RTK extension ownership state: {}",
+            state_path.display()
+        )
+    })?;
+    let mut agents = Vec::new();
+    for agent in content
+        .lines()
+        .filter_map(|line| PiCompatibleAgent::from_state_name(line.trim()))
+    {
+        if !agents.contains(&agent) {
+            agents.push(agent);
+        }
+    }
+    Ok(Some(agents))
+}
+
+fn record_managed_agent(
+    global: bool,
+    path: &Path,
+    agent: PiCompatibleAgent,
+    ctx: InitContext,
+) -> Result<()> {
+    if !global_extension_paths_alias(global, path, agent)? {
+        return Ok(());
+    }
+
+    let state_path = shared_agent_state_path(path);
+    let mut agents = read_managed_agents(path)?.unwrap_or_default();
+    if !agents.contains(&agent) {
+        agents.push(agent);
+    }
+    agents.sort_by_key(|agent| agent.state_name());
+    let content = format!(
+        "{}\n",
+        agents
+            .iter()
+            .map(|agent| agent.state_name())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    write_if_changed(&state_path, &content, "RTK extension ownership state", ctx)?;
+    Ok(())
+}
+
+fn remove_managed_agent_state(
+    global: bool,
+    path: &Path,
+    agent: PiCompatibleAgent,
+    ctx: InitContext,
+) -> Result<()> {
+    if !global_extension_paths_alias(global, path, agent)? {
+        return Ok(());
+    }
+
+    let state_path = shared_agent_state_path(path);
+    if !state_path.exists() {
+        return Ok(());
+    }
+
+    if ctx.dry_run {
+        println!(
+            "[dry-run] would remove RTK extension ownership state: {}",
+            state_path.display()
+        );
+    } else {
+        // nosemgrep: filesystem-deletion -- state belongs exclusively to the RTK-managed extension.
+        fs::remove_file(&state_path).with_context(|| {
+            format!(
+                "Failed to remove RTK extension ownership state: {}",
+                state_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Check whether a global Pi-compatible extension path is shared by both
+/// agents through `PI_CODING_AGENT_DIR`.
+///
+/// The ownership sidecar records which agents RTK installed for a relocated
+/// shared path. Configuration-directory checks remain as a fallback for
+/// installs performed before the sidecar existed or by another tool.
+fn global_extension_is_shared(global: bool, path: &Path, agent: PiCompatibleAgent) -> Result<bool> {
+    if !global_extension_paths_alias(global, path, agent)? {
         return Ok(false);
     }
 
-    match agent {
-        PiCompatibleAgent::Pi => omp_configuration_is_present(),
-        PiCompatibleAgent::Omp => Ok(true),
+    let other_agent = agent.other();
+    if read_managed_agents(path)?.is_some_and(|agents| agents.contains(&other_agent)) {
+        return Ok(true);
     }
+
+    match other_agent {
+        PiCompatibleAgent::Pi => pi_configuration_is_present(),
+        PiCompatibleAgent::Omp => omp_configuration_is_present(),
+    }
+}
+
+fn pi_configuration_is_present() -> Result<bool> {
+    if Path::new(PI_LOCAL_DIR).is_dir() {
+        return Ok(true);
+    }
+
+    Ok(resolve_home_subdir(PI_LOCAL_DIR)?.is_dir())
 }
 
 fn omp_configuration_is_present() -> Result<bool> {
@@ -3662,20 +3852,35 @@ fn confirm_shared_global_uninstall(
     }
 }
 
-fn read_extension_for_uninstall(path: &Path, name: &str, dry_run: bool) -> Option<String> {
+fn read_extension_for_uninstall(
+    path: &Path,
+    name: &str,
+    ctx: InitContext,
+) -> Result<Option<String>> {
     match fs::read_to_string(path) {
-        Ok(content) => Some(content),
+        Ok(content) => Ok(Some(content)),
         Err(error) => {
-            println!(
-                "{} at {} could not be read; leaving it alone: {}",
+            eprintln!(
+                "[warn] {} at {} could not be read; leaving it alone: {}",
                 name,
                 path.display(),
                 error
             );
-            if dry_run {
+            if ctx.dry_run {
+                println!(
+                    "[dry-run] would leave unreadable {} unchanged: {}",
+                    name,
+                    path.display()
+                );
                 print_dry_run_footer();
+                Ok(None)
+            } else {
+                anyhow::bail!(
+                    "{} at {} could not be read; leaving it alone.",
+                    name,
+                    path.display()
+                );
             }
-            None
         }
     }
 }
@@ -3700,7 +3905,7 @@ fn uninstall_pi_with_patch_mode(
         return Ok(());
     }
 
-    let Some(content) = read_extension_for_uninstall(&plugin_path, "Pi extension", dry_run) else {
+    let Some(content) = read_extension_for_uninstall(&plugin_path, "Pi extension", ctx)? else {
         return Ok(());
     };
 
@@ -3751,11 +3956,13 @@ fn uninstall_pi_with_patch_mode(
             "[dry-run] would remove Pi extension: {}",
             plugin_path.display()
         );
+        remove_managed_agent_state(global, &plugin_path, PiCompatibleAgent::Pi, ctx)?;
         print_dry_run_footer();
     } else {
         // nosemgrep: filesystem-deletion -- Pi uninstall removes only a known RTK stock extension.
         fs::remove_file(&plugin_path)
             .with_context(|| format!("Failed to remove Pi extension: {}", plugin_path.display()))?;
+        remove_managed_agent_state(global, &plugin_path, PiCompatibleAgent::Pi, ctx)?;
         if verbose > 0 {
             eprintln!("Removed Pi extension: {}", plugin_path.display());
         }
@@ -3810,7 +4017,9 @@ pub fn run_pi_mode_with_patch_mode(
         )?;
     }
 
-    let installed = write_if_changed(&plugin_path, PI_PLUGIN, "Pi extension", ctx)?;
+    let installed =
+        write_if_changed_allow_unreadable(&plugin_path, PI_PLUGIN, "Pi extension", ctx)?;
+    record_managed_agent(global, &plugin_path, PiCompatibleAgent::Pi, ctx)?;
 
     if dry_run {
         print_dry_run_footer();
@@ -3967,7 +4176,9 @@ pub fn run_omp_mode_with_patch_mode(
         )?;
     }
 
-    let installed = write_if_changed(path.as_path(), PI_PLUGIN, "OMP extension", ctx)?;
+    let installed =
+        write_if_changed_allow_unreadable(path.as_path(), PI_PLUGIN, "OMP extension", ctx)?;
+    record_managed_agent(global, &path, PiCompatibleAgent::Omp, ctx)?;
 
     if dry_run {
         print_dry_run_footer();
@@ -4020,7 +4231,7 @@ pub fn uninstall_omp_with_patch_mode(
         return Ok(());
     }
 
-    let Some(content) = read_extension_for_uninstall(&path, "OMP extension", dry_run) else {
+    let Some(content) = read_extension_for_uninstall(&path, "OMP extension", ctx)? else {
         return Ok(());
     };
 
@@ -4039,11 +4250,13 @@ pub fn uninstall_omp_with_patch_mode(
 
         if dry_run {
             println!("[dry-run] would remove OMP extension: {}", path.display());
+            remove_managed_agent_state(global, &path, PiCompatibleAgent::Omp, ctx)?;
             print_dry_run_footer();
         } else {
             // nosemgrep: filesystem-deletion -- OMP uninstall removes only the RTK-managed extension file.
             fs::remove_file(&path)
                 .with_context(|| format!("Failed to remove OMP extension: {}", path.display()))?;
+            remove_managed_agent_state(global, &path, PiCompatibleAgent::Omp, ctx)?;
             if verbose > 0 {
                 eprintln!("Removed OMP extension: {}", path.display());
             }
@@ -8500,7 +8713,12 @@ mod tests {
         );
         std::env::set_current_dir(&cwd).unwrap();
 
-        result.unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not be read; leaving it alone"),
+            "unreadable extension uninstall should fail clearly: {err}"
+        );
         assert!(path.exists(), "unreadable extension must be left alone");
     }
 
@@ -8626,7 +8844,12 @@ mod tests {
 
             let plugin = omp_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
             assert!(plugin.exists(), "global OMP extension must be created");
-            assert!(global_extension_is_shared(true, &plugin, PiCompatibleAgent::Omp).unwrap());
+            let state_path = shared_agent_state_path(&plugin);
+            assert_eq!(
+                fs::read_to_string(&state_path).unwrap(),
+                "omp\n",
+                "OMP install must record its ownership"
+            );
 
             uninstall_with_patch_mode(
                 true,
@@ -8640,6 +8863,7 @@ mod tests {
             )
             .unwrap();
             assert!(!plugin.exists(), "global OMP extension must be removed");
+            assert!(!state_path.exists(), "ownership state must be removed");
         });
     }
 
@@ -8653,6 +8877,14 @@ mod tests {
             let omp_path = omp_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
             let pi_path = pi_plugin_path_for_scope(true).unwrap();
             assert_eq!(pi_path, omp_path);
+            fs::create_dir_all(omp_path.parent().unwrap()).unwrap();
+            record_managed_agent(
+                true,
+                &omp_path,
+                PiCompatibleAgent::Pi,
+                InitContext::default(),
+            )
+            .unwrap();
             assert!(global_extension_is_shared(true, &omp_path, PiCompatibleAgent::Omp).unwrap());
 
             fs::create_dir_all(OMP_LOCAL_DIR).unwrap();
@@ -8918,7 +9150,12 @@ mod tests {
         );
         std::env::set_current_dir(&cwd).unwrap();
 
-        result.unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("could not be read; leaving it alone"),
+            "unreadable extension uninstall should fail clearly: {err}"
+        );
         assert!(path.exists(), "unreadable extension must be left alone");
     }
 
