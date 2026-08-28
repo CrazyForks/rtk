@@ -19,10 +19,10 @@ with other Pi extensions.
 - Calls `rtk rewrite` via `pi.exec`; mutates `event.input.command` in-place if rewrite differs
 - All error paths return `undefined` (pass through); RTK never blocks execution
 - Version guard at load time: checks `rtk >= 0.23.0`; warns and registers no-op if too old or missing
-- Install updates only current or known historical stock content; it refuses to overwrite a modified or unrelated file at the managed path
+- Install updates only current or known historical stock content; it refuses to overwrite a modified or unrelated file at the managed path. In `--dry-run` mode it reports that refusal without changing files or creating directories.
 - Installed to `.pi/extensions/rtk.ts` by `rtk init --agent pi` (project-local) or `~/.pi/agent/extensions/rtk.ts` by `rtk init --agent pi --global`
 
-The same extension is shared with Oh My Pi (OMP) through OMP's `legacy-pi-compat` layer. OMP installs it at `.omp/extensions/rtk.ts` (project-local) or `~/.omp/agent/extensions/rtk.ts` (global). The global OMP path follows `PI_CODING_AGENT_DIR`, which OMP also honors.
+The same extension is shared with Oh My Pi (OMP) through OMP's `legacy-pi-compat` layer. OMP installs it at `.omp/extensions/rtk.ts` (project-local) or `~/.omp/agent/extensions/rtk.ts` (global). The global OMP path follows `PI_CODING_AGENT_DIR`, which OMP also honors. If that variable is set, Pi and OMP intentionally share one global file; uninstalling either prints a warning before removing the shared integration. RTK currently targets OMP's default profile and `.omp` project directory, not named profiles or custom `PI_CONFIG_DIR` locations.
 
 ## Uninstall
 

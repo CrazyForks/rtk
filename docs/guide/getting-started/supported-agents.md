@@ -112,7 +112,7 @@ rtk init --agent pi
 rtk init --agent pi --global
 ```
 
-Creates `.pi/extensions/rtk.ts` (local) or `~/.pi/agent/extensions/rtk.ts` (global). Pi auto-discovers extensions from both paths on startup. The global path follows `PI_CODING_AGENT_DIR` when set.
+Creates `.pi/extensions/rtk.ts` (local) or `~/.pi/agent/extensions/rtk.ts` (global). Pi auto-discovers extensions from both paths on startup. The global path follows `PI_CODING_AGENT_DIR` when set; OMP uses that same variable, so the two agents share one global extension file in that configuration.
 
 Installation updates only the current or a known historical RTK extension. If the managed path contains a modified or unrelated file, RTK refuses to overwrite it; remove or back it up manually before retrying.
 
@@ -136,6 +136,8 @@ rtk init --agent omp --global
 ```
 
 Creates `.omp/extensions/rtk.ts` (local) or `~/.omp/agent/extensions/rtk.ts` (global). OMP loads the same extension file as Pi through its `legacy-pi-compat` layer, so both agents share `rtk.ts`. The global path follows `PI_CODING_AGENT_DIR`, which OMP also honors for its agent directory.
+
+When `PI_CODING_AGENT_DIR` is set, the global Pi and OMP targets intentionally alias to one file. Uninstalling either agent prints a warning and removes that shared extension, so confirm that neither agent should use it first. RTK currently targets OMP's default profile and `.omp` project directory; named OMP profiles and custom `PI_CONFIG_DIR` locations are not auto-detected.
 
 Installation updates only the current or a known historical RTK extension. If the managed path contains a modified or unrelated file, RTK refuses to overwrite it; remove or back it up manually before retrying.
 
