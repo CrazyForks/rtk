@@ -32,8 +32,10 @@ const OPENCODE_PLUGIN: &str = include_str!("../../hooks/opencode/rtk.ts");
 const PI_PLUGIN: &str = include_str!("../../hooks/pi/rtk.ts");
 
 // Stable code marker used to recognize a modified RTK extension without
-// relying on explanatory comments that users may remove.
-const PI_PLUGIN_REWRITE_MARKER: &str = "pi.exec(\"rtk\", [\"rewrite\"";
+// relying on explanatory comments that users may remove. The marker matches
+// both the current `pi.exec` call and older stock revisions that imported
+// `exec` locally before invoking it.
+const PI_PLUGIN_REWRITE_MARKER: &str = "exec(\"rtk\", [\"rewrite\"";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PiCompatibleAgent {
@@ -3465,9 +3467,9 @@ fn pi_plugin_path_for_scope(global: bool) -> Result<PathBuf> {
 /// Check whether a managed Pi-compatible extension can be installed.
 ///
 /// Returns `false` when the existing file is unknown and the selected policy
-/// declines or previews the overwrite; the caller can then print the common
-/// dry-run footer without touching the file system. Validation runs before
-/// parent directory creation.
+/// declines or previews the overwrite; the caller can then either report the
+/// declined action or print the common dry-run footer without touching the
+/// file system. Validation runs before parent directory creation.
 fn validate_stock_pi_plugin_path(
     path: &Path,
     name: &str,
@@ -3485,34 +3487,26 @@ fn validate_stock_pi_plugin_path(
                         name,
                         path.display()
                     ),
-                    PatchMode::Auto => {}
+                    PatchMode::Auto => println!(
+                        "[dry-run] would overwrite non-stock {}: {}",
+                        name,
+                        path.display()
+                    ),
                     PatchMode::Skip => println!(
                         "[dry-run] would leave {} unchanged: {}",
                         name,
                         path.display()
                     ),
                 }
-                return Ok(matches!(patch_mode, PatchMode::Auto));
+                return Ok(false);
             }
 
             let should_overwrite = match patch_mode {
                 PatchMode::Auto => true,
-                PatchMode::Skip => {
-                    println!(
-                        "{} at {} was not changed; remove or back up the file manually before retrying.",
-                        name,
-                        path.display()
-                    );
-                    false
-                }
+                PatchMode::Skip => false,
                 PatchMode::Ask => {
                     let prompt = format!("Overwrite the non-stock {} at {}?", name, path.display());
-                    if prompt_user_confirmation(&prompt)? {
-                        true
-                    } else {
-                        println!("{} at {} was not changed.", name, path.display());
-                        false
-                    }
+                    prompt_user_confirmation(&prompt)?
                 }
             };
 
@@ -3565,6 +3559,12 @@ fn ensure_pi_extensions_dir(parent: &Path, name: &str, ctx: InitContext) -> Resu
 
 /// Check whether a global Pi-compatible extension path is shared by both
 /// agents through `PI_CODING_AGENT_DIR`.
+///
+/// A relocated Pi directory alone is not evidence that OMP is installed:
+/// OMP also honors `PI_CODING_AGENT_DIR`, so the two resolved paths are equal
+/// for every relocated Pi user. Pi-side warnings/prompts therefore require
+/// an OMP config directory, while an explicit OMP operation is itself enough
+/// evidence to warn before touching the shared target.
 fn global_extension_is_shared(global: bool, path: &Path, agent: PiCompatibleAgent) -> Result<bool> {
     if !global {
         return Ok(false);
@@ -3575,7 +3575,22 @@ fn global_extension_is_shared(global: bool, path: &Path, agent: PiCompatibleAgen
         PiCompatibleAgent::Omp => pi_plugin_path_for_scope(true)?,
     };
 
-    Ok(path == other_path)
+    if path != other_path {
+        return Ok(false);
+    }
+
+    match agent {
+        PiCompatibleAgent::Pi => omp_configuration_is_present(),
+        PiCompatibleAgent::Omp => Ok(true),
+    }
+}
+
+fn omp_configuration_is_present() -> Result<bool> {
+    if Path::new(OMP_LOCAL_DIR).is_dir() {
+        return Ok(true);
+    }
+
+    Ok(resolve_home_subdir(OMP_LOCAL_DIR)?.is_dir())
 }
 
 fn warn_if_global_extension_shared_on_install(
@@ -3723,8 +3738,12 @@ fn uninstall_pi_with_patch_mode(
     )? {
         if dry_run {
             print_dry_run_footer();
+            return Ok(());
         }
-        return Ok(());
+        anyhow::bail!(
+            "Shared Pi/OMP extension at {} was not removed; rerun with --auto-patch to approve the removal.",
+            plugin_path.display()
+        );
     }
 
     if dry_run {
@@ -3771,8 +3790,12 @@ pub fn run_pi_mode_with_patch_mode(
     if !validate_stock_pi_plugin_path(&plugin_path, "Pi extension", patch_mode, ctx)? {
         if dry_run {
             print_dry_run_footer();
+            return Ok(());
         }
-        return Ok(());
+        anyhow::bail!(
+            "Pi extension at {} was not changed; remove or back up the file manually before retrying.",
+            plugin_path.display()
+        );
     }
 
     if let Some(parent) = plugin_path.parent() {
@@ -3924,8 +3947,12 @@ pub fn run_omp_mode_with_patch_mode(
     if !validate_stock_pi_plugin_path(&path, "OMP extension", patch_mode, ctx)? {
         if dry_run {
             print_dry_run_footer();
+            return Ok(());
         }
-        return Ok(());
+        anyhow::bail!(
+            "OMP extension at {} was not changed; remove or back up the file manually before retrying.",
+            path.display()
+        );
     }
 
     if let Some(parent) = path.parent() {
@@ -4002,8 +4029,12 @@ pub fn uninstall_omp_with_patch_mode(
         {
             if dry_run {
                 print_dry_run_footer();
+                return Ok(());
             }
-            return Ok(());
+            anyhow::bail!(
+                "Shared Pi/OMP extension at {} was not removed; rerun with --auto-patch to approve the removal.",
+                path.display()
+            );
         }
 
         if dry_run {
@@ -4390,8 +4421,13 @@ fn show_omp_config() -> Result<()> {
 
 fn print_omp_extension_status(label: &str, path: &Path) -> Result<()> {
     if path.exists() {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(_) => {
+                println!("  {}: {} (unreadable)", label, path.display());
+                return Ok(());
+            }
+        };
         if is_current_pi_plugin(&content) {
             println!("  {}: {} (up to date)", label, path.display());
         } else if is_known_stock_pi_plugin(&content) {
@@ -8111,7 +8147,12 @@ mod tests {
         let result = run_pi_mode_with_patch_mode(false, PatchMode::Skip, InitContext::default());
         std::env::set_current_dir(&cwd).unwrap();
 
-        result.unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("was not changed"),
+            "unexpected error: {}",
+            err
+        );
         assert_eq!(fs::read_to_string(path).unwrap(), modified);
     }
 
@@ -8546,6 +8587,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(looks_like_rtk_pi_plugin(&code_without_comments));
+        assert!(looks_like_rtk_pi_plugin(
+            "import { exec } from 'pi';\nexec(\"rtk\", [\"rewrite\", cmd]);\n"
+        ));
         assert!(!looks_like_rtk_pi_plugin("const note = 'rtk rewrite';\n"));
     }
 
@@ -8602,13 +8646,19 @@ mod tests {
     #[test]
     fn test_global_uninstall_detects_shared_pi_omp_extension() {
         let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
         with_omp_dir_override(&tmp, |omp_dir| {
             let omp_path = omp_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
             let pi_path = pi_plugin_path_for_scope(true).unwrap();
             assert_eq!(pi_path, omp_path);
-            assert!(global_extension_is_shared(true, &pi_path, PiCompatibleAgent::Pi).unwrap());
             assert!(global_extension_is_shared(true, &omp_path, PiCompatibleAgent::Omp).unwrap());
+
+            fs::create_dir_all(OMP_LOCAL_DIR).unwrap();
+            assert!(global_extension_is_shared(true, &pi_path, PiCompatibleAgent::Pi).unwrap());
         });
+        std::env::set_current_dir(&cwd).unwrap();
     }
 
     #[test]
@@ -8646,7 +8696,12 @@ mod tests {
         let result = run_omp_mode_with_patch_mode(false, PatchMode::Skip, InitContext::default());
         std::env::set_current_dir(&cwd).unwrap();
 
-        result.unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("was not changed"),
+            "unexpected error: {}",
+            err
+        );
         assert_eq!(fs::read_to_string(path).unwrap(), modified);
     }
 

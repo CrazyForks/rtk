@@ -19,10 +19,10 @@ with other Pi extensions.
 - Calls `rtk rewrite` via `pi.exec`; mutates `event.input.command` in-place if rewrite differs
 - All error paths return `undefined` (pass through); RTK never blocks execution
 - Version guard at load time: checks `rtk >= 0.23.0`; warns and registers no-op if too old or missing
-- Install updates only current or known historical stock content. For modified or unrelated content it asks before overwriting; `--auto-patch` approves and `--no-patch` leaves the file unchanged. In `--dry-run` mode it reports the prompt without changing files or creating directories. LF and CRLF line endings are treated as the same stock content.
+- Install updates only current or known historical stock content. For modified or unrelated content it asks before overwriting; `--auto-patch` approves and `--no-patch` leaves the file unchanged. A declined protected update, including `--no-patch`, exits nonzero; in `--dry-run` mode it reports the prompt without changing files or creating directories. LF and CRLF line endings are treated as the same stock content.
 - Installed to `.pi/extensions/rtk.ts` by `rtk init --agent pi` (project-local) or `~/.pi/agent/extensions/rtk.ts` by `rtk init --agent pi --global`
 
-The same extension is shared with Oh My Pi (OMP) through OMP's `legacy-pi-compat` layer. OMP installs it at `.omp/extensions/rtk.ts` (project-local) or `~/.omp/agent/extensions/rtk.ts` (global). The global OMP path follows `PI_CODING_AGENT_DIR`, which OMP also honors. If that variable is set, Pi and OMP intentionally share one global file; install warns about the alias and uninstall asks before removing the shared integration (`--auto-patch` approves it). RTK currently targets OMP's default profile and `.omp` project directory, not named profiles or custom `PI_CONFIG_DIR` locations.
+The same extension is shared with Oh My Pi (OMP) through OMP's `legacy-pi-compat` layer. OMP installs it at `.omp/extensions/rtk.ts` (project-local) or `~/.omp/agent/extensions/rtk.ts` (global). The global OMP path follows `PI_CODING_AGENT_DIR`, which OMP also honors. If that variable is set, OMP-targeted commands disclose the shared global file; Pi-targeted commands warn about the alias when an OMP config directory (`.omp` in the current project or `~/.omp`) is present. Uninstall asks before removing a detected shared integration (`--auto-patch` approves it); a declined shared uninstall, including `--no-patch`, exits nonzero. RTK currently targets OMP's default profile and `.omp` project directory, not named profiles or custom `PI_CONFIG_DIR` locations.
 
 ## Uninstall
 
@@ -36,7 +36,7 @@ rtk init --uninstall --agent pi --global
 # → removes ~/.pi/agent/extensions/rtk.ts
 ```
 
-Uninstalling an absent extension is a no-op. Current and known historical stock files are removed, while modified RTK content is preserved and causes a normal uninstall to fail with a manual-removal message; `--dry-run` previews that refusal. Unreadable and unrelated content is left alone. When global Pi and OMP paths alias through `PI_CODING_AGENT_DIR`, uninstall asks before removing the shared file; `--auto-patch` approves and `--no-patch` leaves it in place. Only the extension file is managed by install/uninstall.
+Uninstalling an absent extension is a no-op. Current and known historical stock files are removed, while modified RTK content is preserved and causes a normal uninstall to fail with a manual-removal message; `--dry-run` previews that refusal. Unreadable and unrelated content is left alone. When global Pi and OMP paths alias through `PI_CODING_AGENT_DIR`, uninstall asks before removing a detected shared file; `--auto-patch` approves and `--no-patch` leaves it in place with a nonzero exit. Only the extension file is managed by install/uninstall.
 
 ## Testing
 

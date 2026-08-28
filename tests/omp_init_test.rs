@@ -8,6 +8,7 @@ use tempfile::TempDir;
 fn run_rtk(cwd: &Path, agent_dir: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_rtk"))
         .env("LC_ALL", "C")
+        .env("HOME", cwd.join("home"))
         .env("PI_CODING_AGENT_DIR", agent_dir)
         .args(args)
         .current_dir(cwd)
@@ -105,11 +106,12 @@ fn omp_dry_run_stock_includes_footer_and_real_uninstall_mentions_restart() {
         ],
     );
     assert!(
-        skipped.status.success(),
-        "OMP uninstall skip failed: {}",
+        !skipped.status.success(),
+        "OMP uninstall skip unexpectedly succeeded: {}",
         stderr(&skipped)
     );
     assert!(stdout(&skipped).contains("Skipped removal of shared Pi/OMP extension"));
+    assert!(stderr(&skipped).contains("was not removed"));
     assert!(agent_dir.join("extensions/rtk.ts").exists());
 
     let uninstall = run_rtk(
@@ -159,6 +161,19 @@ fn pi_dry_run_modified_extension_previews_confirmation_without_error() {
     assert!(stdout(&output).contains("[dry-run] Nothing written."));
     assert_eq!(std::fs::read_to_string(&extension).unwrap(), original);
 
+    let auto_dry_run = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "pi", "--auto-patch", "--dry-run"],
+    );
+    assert!(
+        auto_dry_run.status.success(),
+        "Pi auto-patch dry-run failed: {}",
+        stderr(&auto_dry_run)
+    );
+    assert!(stdout(&auto_dry_run).contains("[dry-run] would overwrite non-stock"));
+    assert_eq!(std::fs::read_to_string(&extension).unwrap(), original);
+
     let auto = run_rtk(
         project.path(),
         &agent_dir,
@@ -173,6 +188,36 @@ fn pi_dry_run_modified_extension_previews_confirmation_without_error() {
         std::fs::read_to_string(extension).unwrap(),
         include_str!("../hooks/pi/rtk.ts")
     );
+}
+
+#[test]
+fn pi_relocated_global_without_omp_does_not_warn_or_prompt() {
+    let project = tempfile::tempdir().unwrap();
+    let agent_dir = project.path().join("pi-agent");
+
+    let install = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "pi", "--global"],
+    );
+    assert!(
+        install.status.success(),
+        "Pi global install failed: {}",
+        stderr(&install)
+    );
+    assert!(!stderr(&install).contains("share the global extension path"));
+
+    let uninstall = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "pi", "--global", "--uninstall"],
+    );
+    assert!(
+        uninstall.status.success(),
+        "Pi global uninstall unexpectedly prompted or failed: {}",
+        stderr(&uninstall)
+    );
+    assert!(!agent_dir.join("extensions/rtk.ts").exists());
 }
 
 #[test]
@@ -263,4 +308,28 @@ fn omp_show_modified_extension_explains_install_refusal() {
         stderr(&output)
     );
     assert!(stdout(&output).contains("rtk init will refuse to overwrite"));
+}
+
+#[test]
+fn omp_show_reports_unreadable_extension_and_continues() {
+    let project = TempDir::new().unwrap();
+    let agent_dir = project.path().join("omp-agent");
+    let extension_dir = agent_dir.join("extensions");
+    std::fs::create_dir_all(&extension_dir).unwrap();
+    std::fs::write(extension_dir.join("rtk.ts"), [0xff, 0xfe, 0xfd]).unwrap();
+
+    let output = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "omp", "--global", "--show"],
+    );
+
+    assert!(
+        output.status.success(),
+        "OMP show failed for unreadable extension: {}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains("Global extension:"));
+    assert!(stdout(&output).contains("(unreadable)"));
+    assert!(stdout(&output).contains("Project extension:"));
 }

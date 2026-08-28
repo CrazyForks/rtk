@@ -114,7 +114,7 @@ rtk init --agent pi --global
 
 Creates `.pi/extensions/rtk.ts` (local) or `~/.pi/agent/extensions/rtk.ts` (global). Pi auto-discovers extensions from both paths on startup. The global path follows `PI_CODING_AGENT_DIR` when set; OMP uses that same variable, so the two agents share one global extension file in that configuration and RTK warns when installing there.
 
-Installation updates only the current or a known historical RTK extension. If the managed path contains modified or unrelated content, RTK asks before overwriting it; use `--auto-patch` to approve without prompting or `--no-patch` to leave it unchanged. `--dry-run` reports the prompt without changing files. LF and CRLF line endings are treated as the same stock extension.
+Installation updates only the current or a known historical RTK extension. If the managed path contains modified or unrelated content, RTK asks before overwriting it; use `--auto-patch` to approve without prompting or `--no-patch` to leave it unchanged. A declined protected update, including `--no-patch`, exits nonzero so automation can detect that no install occurred. `--dry-run` reports the prompt without changing files. LF and CRLF line endings are treated as the same stock extension.
 
 Uninstall:
 
@@ -137,9 +137,9 @@ rtk init --agent omp --global
 
 Creates `.omp/extensions/rtk.ts` (local) or `~/.omp/agent/extensions/rtk.ts` (global). OMP loads the same extension file as Pi through its `legacy-pi-compat` layer, so both agents share `rtk.ts`. The global path follows `PI_CODING_AGENT_DIR`, which OMP also honors for its agent directory.
 
-When `PI_CODING_AGENT_DIR` is set, the global Pi and OMP targets intentionally alias to one file. Installing either agent warns about the shared path; uninstalling either asks before removing it, so confirm that neither agent should use it first (or pass `--auto-patch` to approve). RTK currently targets OMP's default profile and `.omp` project directory; named OMP profiles and custom `PI_CONFIG_DIR` locations are not auto-detected.
+When `PI_CODING_AGENT_DIR` is set, the global Pi and OMP targets can alias to one file. OMP-targeted commands disclose that shared path; Pi-targeted global commands do so when an OMP config directory (`.omp` in the current project or `~/.omp`) is present. Uninstalling a detected shared file asks before removing it, so confirm that neither agent should use it first (or pass `--auto-patch` to approve). A declined shared uninstall, including `--no-patch`, exits nonzero; `--dry-run` remains a successful preview. RTK currently targets OMP's default profile and `.omp` project directory; named OMP profiles and custom `PI_CONFIG_DIR` locations are not auto-detected.
 
-Installation updates only the current or a known historical RTK extension. If the managed path contains modified or unrelated content, RTK asks before overwriting it; use `--auto-patch` to approve without prompting or `--no-patch` to leave it unchanged. `--dry-run` reports the prompt without changing files. LF and CRLF line endings are treated as the same stock extension.
+Installation updates only the current or a known historical RTK extension. If the managed path contains modified or unrelated content, RTK asks before overwriting it; use `--auto-patch` to approve without prompting or `--no-patch` to leave it unchanged. A declined protected update, including `--no-patch`, exits nonzero so automation can detect that no install occurred. `--dry-run` reports the prompt without changing files. LF and CRLF line endings are treated as the same stock extension.
 
 Uninstall:
 
@@ -148,7 +148,7 @@ rtk init --uninstall --agent omp
 rtk init --uninstall --agent omp --global
 ```
 
-Removes only the current or known historical stock OMP extension. If the file has been modified after install, a normal uninstall aborts with a message instead of removing it, while `--dry-run` previews that refusal; unreadable or unrelated content is left in place. When the global Pi and OMP paths alias through `PI_CODING_AGENT_DIR`, uninstall asks before removing the shared file; use `--auto-patch` to approve or `--no-patch` to keep it.
+Removes only the current or known historical stock OMP extension. If the file has been modified after install, a normal uninstall aborts with a message instead of removing it, while `--dry-run` previews that refusal; unreadable or unrelated content is left in place. When the global Pi and OMP paths alias through `PI_CODING_AGENT_DIR`, uninstall asks before removing the shared file; use `--auto-patch` to approve or `--no-patch` to keep it. A declined shared uninstall exits nonzero so scripts can detect that the file remains.
 
 ### OpenClaw
 
