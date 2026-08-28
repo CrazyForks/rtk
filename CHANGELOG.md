@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **hooks:** add shared Oh My Pi support and protect Pi/OMP extensions from accidental overwrite or removal, including untouched historical stock revisions
 * **hooks:** honor `PI_CODING_AGENT_DIR` for global OMP extension paths and keep dry-run uninstall output consistent
 * **hooks:** make shared Pi/OMP path aliasing explicit during uninstall and keep dry-run install behavior non-destructive
+* **hooks:** normalize Pi/OMP extension line endings and require explicit confirmation for protected overwrites and shared global uninstalls
 
 ## [0.42.4](https://github.com/rtk-ai/rtk/compare/v0.42.3...v0.42.4) (2026-06-12)
 

@@ -35,11 +35,26 @@ const PI_PLUGIN: &str = include_str!("../../hooks/pi/rtk.ts");
 // relying on explanatory comments that users may remove.
 const PI_PLUGIN_REWRITE_MARKER: &str = "pi.exec(\"rtk\", [\"rewrite\"";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PiCompatibleAgent {
+    Pi,
+    Omp,
+}
+
+impl PiCompatibleAgent {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pi => "Pi",
+            Self::Omp => "OMP",
+        }
+    }
+}
+
 // SHA-256 hashes of stock Pi extension revisions that may exist on user
 // machines, including the current embedded file. Keep historical entries
 // when changing the extension so an untouched older install can still be
-// removed safely. Hashes are computed after trimming trailing whitespace,
-// matching the current comparison below.
+// removed safely. Hashes are computed after normalizing CRLF to LF and
+// trimming trailing whitespace, matching the comparisons below.
 // Revisions: current (12a7cf0), 1da5793, a7cab79, 9bd6e6f, 8bc8b46,
 // f6a5451, 3e7d02d, and fb61481.
 const KNOWN_PI_PLUGIN_HASHES: &[&str] = &[
@@ -456,17 +471,18 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
-/// Prompt user for consent to patch settings.json
-/// Prints to stderr (stdout may be piped), reads from stdin
-/// Default is No (capital N)
-fn prompt_user_consent(settings_path: &Path) -> Result<bool> {
+/// Prompt user for confirmation.
+/// Prints to stderr (stdout may be piped), reads from stdin, and defaults to
+/// No in non-interactive environments.
+fn prompt_user_confirmation(prompt: &str) -> Result<bool> {
     use std::io::{self, BufRead, IsTerminal};
 
-    eprintln!("\nPatch existing {}? [y/N] ", settings_path.display());
+    eprint!("\n{} [y/N] ", prompt);
+    io::stderr().flush().context("Failed to flush prompt")?;
 
-    // If stdin is not a terminal (piped), default to No
+    // If stdin is not a terminal (piped), default to No.
     if !io::stdin().is_terminal() {
-        eprintln!("(non-interactive mode, defaulting to N)");
+        eprintln!("\n(non-interactive mode, defaulting to N)");
         return Ok(false);
     }
 
@@ -479,6 +495,11 @@ fn prompt_user_consent(settings_path: &Path) -> Result<bool> {
 
     let response = line.trim().to_lowercase();
     Ok(response == "y" || response == "yes")
+}
+
+/// Prompt user for consent to patch settings.json.
+fn prompt_user_consent(settings_path: &Path) -> Result<bool> {
+    prompt_user_confirmation(&format!("Patch existing {}?", settings_path.display()))
 }
 
 pub fn save_telemetry_consent(accepted: bool) -> Result<()> {
@@ -662,6 +683,7 @@ fn remove_hook_from_settings(ctx: InitContext) -> Result<bool> {
 }
 
 /// Full uninstall for Claude, Gemini, Codex, Cursor, Pi, or OMP artifacts.
+#[allow(dead_code)] // Kept as the default-policy API for in-crate callers and tests.
 pub fn uninstall(
     global: bool,
     gemini: bool,
@@ -669,6 +691,22 @@ pub fn uninstall(
     cursor: bool,
     pi: bool,
     omp: bool,
+    ctx: InitContext,
+) -> Result<()> {
+    uninstall_with_patch_mode(global, gemini, codex, cursor, pi, omp, PatchMode::Ask, ctx)
+}
+
+/// Full uninstall with an explicit confirmation policy for managed
+/// Pi-compatible extensions.
+#[allow(clippy::too_many_arguments)]
+pub fn uninstall_with_patch_mode(
+    global: bool,
+    gemini: bool,
+    codex: bool,
+    cursor: bool,
+    pi: bool,
+    omp: bool,
+    patch_mode: PatchMode,
     ctx: InitContext,
 ) -> Result<()> {
     let InitContext { verbose, dry_run } = ctx;
@@ -708,12 +746,12 @@ pub fn uninstall(
     }
 
     if pi {
-        uninstall_pi(global, ctx)?;
+        uninstall_pi_with_patch_mode(global, patch_mode, ctx)?;
         return Ok(());
     }
 
     if omp {
-        uninstall_omp(global, ctx)?;
+        uninstall_omp_with_patch_mode(global, patch_mode, ctx)?;
         return Ok(());
     }
 
@@ -3426,35 +3464,72 @@ fn pi_plugin_path_for_scope(global: bool) -> Result<PathBuf> {
 
 /// Check whether a managed Pi-compatible extension can be installed.
 ///
-/// Returns `false` only for a dry-run where the existing file is unknown; the
-/// caller can then print the common dry-run footer without touching the file
-/// system. A real install fails before creating any parent directories.
-fn validate_stock_pi_plugin_path(path: &Path, name: &str, ctx: InitContext) -> Result<bool> {
+/// Returns `false` when the existing file is unknown and the selected policy
+/// declines or previews the overwrite; the caller can then print the common
+/// dry-run footer without touching the file system. Validation runs before
+/// parent directory creation.
+fn validate_stock_pi_plugin_path(
+    path: &Path,
+    name: &str,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<bool> {
     if path.exists() {
         let existing = fs::read_to_string(path)
             .with_context(|| format!("Failed to read {}: {}", name, path.display()))?;
         if !is_known_stock_pi_plugin(&existing) {
             if ctx.dry_run {
-                println!(
-                    "[dry-run] would refuse to overwrite {}: {}",
-                    name,
-                    path.display()
-                );
-                return Ok(false);
+                match patch_mode {
+                    PatchMode::Ask => println!(
+                        "[dry-run] would prompt before overwriting {}: {}",
+                        name,
+                        path.display()
+                    ),
+                    PatchMode::Auto => {}
+                    PatchMode::Skip => println!(
+                        "[dry-run] would leave {} unchanged: {}",
+                        name,
+                        path.display()
+                    ),
+                }
+                return Ok(matches!(patch_mode, PatchMode::Auto));
             }
-            anyhow::bail!(
-                "{} at {} is not a known stock RTK extension; refusing to overwrite it. Remove or back up the file manually before retrying.",
-                name,
-                path.display()
-            );
+
+            let should_overwrite = match patch_mode {
+                PatchMode::Auto => true,
+                PatchMode::Skip => {
+                    println!(
+                        "{} at {} was not changed; remove or back up the file manually before retrying.",
+                        name,
+                        path.display()
+                    );
+                    false
+                }
+                PatchMode::Ask => {
+                    let prompt = format!("Overwrite the non-stock {} at {}?", name, path.display());
+                    if prompt_user_confirmation(&prompt)? {
+                        true
+                    } else {
+                        println!("{} at {} was not changed.", name, path.display());
+                        false
+                    }
+                }
+            };
+
+            return Ok(should_overwrite);
         }
     }
 
     Ok(true)
 }
 
+fn normalize_pi_plugin_line_endings(content: &str) -> String {
+    content.replace("\r\n", "\n")
+}
+
 fn is_current_pi_plugin(content: &str) -> bool {
-    content.trim_end() == PI_PLUGIN.trim_end()
+    normalize_pi_plugin_line_endings(content).trim_end()
+        == normalize_pi_plugin_line_endings(PI_PLUGIN).trim_end()
 }
 
 fn looks_like_rtk_pi_plugin(content: &str) -> bool {
@@ -3466,7 +3541,8 @@ fn is_known_stock_pi_plugin(content: &str) -> bool {
         return true;
     }
 
-    let hash = integrity::compute_hash_bytes(content.trim_end().as_bytes());
+    let normalized = normalize_pi_plugin_line_endings(content);
+    let hash = integrity::compute_hash_bytes(normalized.trim_end().as_bytes());
     KNOWN_PI_PLUGIN_HASHES
         .iter()
         .any(|expected| *expected == hash)
@@ -3487,39 +3563,116 @@ fn ensure_pi_extensions_dir(parent: &Path, name: &str, ctx: InitContext) -> Resu
     Ok(())
 }
 
-/// Warn when a single-agent global uninstall targets the path shared by Pi
-/// and OMP. In that configuration one file legitimately serves both agents,
-/// so removing it through either agent removes the other's integration too.
-fn global_extension_is_shared(global: bool, path: &Path, agent_name: &str) -> Result<bool> {
+/// Check whether a global Pi-compatible extension path is shared by both
+/// agents through `PI_CODING_AGENT_DIR`.
+fn global_extension_is_shared(global: bool, path: &Path, agent: PiCompatibleAgent) -> Result<bool> {
     if !global {
         return Ok(false);
     }
 
-    let other_path = if agent_name == "Pi" {
-        omp_extension_path_for_scope(true)?
-    } else {
-        pi_plugin_path_for_scope(true)?
+    let other_path = match agent {
+        PiCompatibleAgent::Pi => omp_extension_path_for_scope(true)?,
+        PiCompatibleAgent::Omp => pi_plugin_path_for_scope(true)?,
     };
 
     Ok(path == other_path)
 }
 
-fn warn_if_global_extension_shared(global: bool, path: &Path, agent_name: &str) -> Result<()> {
-    if global_extension_is_shared(global, path, agent_name)? {
+fn warn_if_global_extension_shared_on_install(
+    global: bool,
+    path: &Path,
+    agent: PiCompatibleAgent,
+) -> Result<()> {
+    if global_extension_is_shared(global, path, agent)? {
         eprintln!(
-            "[warn] Pi and OMP share the global extension path at {} via PI_CODING_AGENT_DIR; uninstalling {} also removes the other agent's shared integration.",
+            "[warn] Pi and OMP share the global extension path at {} via PI_CODING_AGENT_DIR; installing {} here enables the shared integration for both agents.",
             path.display(),
-            agent_name
+            agent.name()
         );
     }
 
     Ok(())
 }
 
+fn confirm_shared_global_uninstall(
+    global: bool,
+    path: &Path,
+    agent: PiCompatibleAgent,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<bool> {
+    if !global_extension_is_shared(global, path, agent)? {
+        return Ok(true);
+    }
+
+    eprintln!(
+        "[warn] Pi and OMP share the global extension path at {} via PI_CODING_AGENT_DIR; uninstalling {} also removes the other agent's shared integration.",
+        path.display(),
+        agent.name()
+    );
+
+    match patch_mode {
+        PatchMode::Auto => Ok(true),
+        PatchMode::Skip => {
+            if ctx.dry_run {
+                println!(
+                    "[dry-run] would leave shared Pi/OMP extension unchanged: {}",
+                    path.display()
+                );
+            } else {
+                println!(
+                    "Skipped removal of shared Pi/OMP extension: {}",
+                    path.display()
+                );
+            }
+            Ok(false)
+        }
+        PatchMode::Ask => {
+            if ctx.dry_run {
+                println!(
+                    "[dry-run] would prompt before removing shared Pi/OMP extension: {}",
+                    path.display()
+                );
+                return Ok(false);
+            }
+
+            let prompt = format!("Remove the shared Pi/OMP extension at {}?", path.display());
+            if prompt_user_confirmation(&prompt)? {
+                Ok(true)
+            } else {
+                println!("Skipped removal of shared Pi/OMP extension.");
+                Ok(false)
+            }
+        }
+    }
+}
+
+fn read_extension_for_uninstall(path: &Path, name: &str, dry_run: bool) -> Option<String> {
+    match fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(error) => {
+            println!(
+                "{} at {} could not be read; leaving it alone: {}",
+                name,
+                path.display(),
+                error
+            );
+            if dry_run {
+                print_dry_run_footer();
+            }
+            None
+        }
+    }
+}
+
 /// Uninstall Pi extension for the given scope.
 /// Mirrors `uninstall_codex` / `uninstall_hermes`: extracted from the dispatcher
 /// so it can be tested and reasoned about independently.
-fn uninstall_pi(global: bool, ctx: InitContext) -> Result<()> {
+fn uninstall_pi_with_patch_mode(
+    global: bool,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<()> {
     let InitContext { verbose, dry_run } = ctx;
     let plugin_path = pi_plugin_path_for_scope(global)?;
 
@@ -3532,11 +3685,20 @@ fn uninstall_pi(global: bool, ctx: InitContext) -> Result<()> {
         return Ok(());
     }
 
-    let content = fs::read_to_string(&plugin_path)
-        .with_context(|| format!("Failed to read Pi extension: {}", plugin_path.display()))?;
+    let Some(content) = read_extension_for_uninstall(&plugin_path, "Pi extension", dry_run) else {
+        return Ok(());
+    };
 
     if !is_known_stock_pi_plugin(&content) {
         if looks_like_rtk_pi_plugin(&content) {
+            if dry_run {
+                println!(
+                    "[dry-run] would refuse to remove Pi extension: {}",
+                    plugin_path.display()
+                );
+                print_dry_run_footer();
+                return Ok(());
+            }
             anyhow::bail!(
                 "Pi extension at {} contains RTK content that does not match the stock extension. Remove the file manually.",
                 plugin_path.display()
@@ -3552,7 +3714,18 @@ fn uninstall_pi(global: bool, ctx: InitContext) -> Result<()> {
         return Ok(());
     }
 
-    warn_if_global_extension_shared(global, &plugin_path, "Pi")?;
+    if !confirm_shared_global_uninstall(
+        global,
+        &plugin_path,
+        PiCompatibleAgent::Pi,
+        patch_mode,
+        ctx,
+    )? {
+        if dry_run {
+            print_dry_run_footer();
+        }
+        return Ok(());
+    }
 
     if dry_run {
         println!(
@@ -3578,12 +3751,27 @@ fn uninstall_pi(global: bool, ctx: InitContext) -> Result<()> {
 ///
 /// global=true  → `$PI_CODING_AGENT_DIR/extensions/rtk.ts`
 /// global=false → `.pi/extensions/rtk.ts`
+#[allow(dead_code)] // Kept as the default-policy API for in-crate callers and tests.
 pub fn run_pi_mode(global: bool, ctx: InitContext) -> Result<()> {
+    run_pi_mode_with_patch_mode(global, PatchMode::Ask, ctx)
+}
+
+/// Install the Pi extension with an explicit confirmation policy for an
+/// existing non-stock file.
+pub fn run_pi_mode_with_patch_mode(
+    global: bool,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
     let plugin_path = pi_plugin_path_for_scope(global)?;
 
-    if !validate_stock_pi_plugin_path(&plugin_path, "Pi extension", ctx)? {
-        print_dry_run_footer();
+    warn_if_global_extension_shared_on_install(global, &plugin_path, PiCompatibleAgent::Pi)?;
+
+    if !validate_stock_pi_plugin_path(&plugin_path, "Pi extension", patch_mode, ctx)? {
+        if dry_run {
+            print_dry_run_footer();
+        }
         return Ok(());
     }
 
@@ -3716,12 +3904,27 @@ fn resolve_omp_dir() -> Result<PathBuf> {
 ///
 /// global=true  -> `$HOME/.omp/agent/extensions/rtk.ts`
 /// global=false -> `.omp/extensions/rtk.ts`
+#[allow(dead_code)] // Kept as the default-policy API for in-crate callers and tests.
 pub fn run_omp_mode(global: bool, ctx: InitContext) -> Result<()> {
+    run_omp_mode_with_patch_mode(global, PatchMode::Ask, ctx)
+}
+
+/// Install the shared Pi extension file for OMP with an explicit
+/// confirmation policy for an existing non-stock file.
+pub fn run_omp_mode_with_patch_mode(
+    global: bool,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
     let path = omp_extension_path_for_scope(global)?;
 
-    if !validate_stock_pi_plugin_path(&path, "OMP extension", ctx)? {
-        print_dry_run_footer();
+    warn_if_global_extension_shared_on_install(global, &path, PiCompatibleAgent::Omp)?;
+
+    if !validate_stock_pi_plugin_path(&path, "OMP extension", patch_mode, ctx)? {
+        if dry_run {
+            print_dry_run_footer();
+        }
         return Ok(());
     }
 
@@ -3766,7 +3969,18 @@ fn print_omp_result(extension_path: &Path, installed: bool) {
 /// historical stock content is removed; RTK content that no longer matches a
 /// known stock revision is left in place with a manual-removal notice.
 /// Unrelated content is never touched.
+#[allow(dead_code)] // Kept as the default-policy API for in-crate callers and tests.
 pub fn uninstall_omp(global: bool, ctx: InitContext) -> Result<()> {
+    uninstall_omp_with_patch_mode(global, PatchMode::Ask, ctx)
+}
+
+/// Uninstall the OMP extension with an explicit confirmation policy for a
+/// global path shared with Pi.
+pub fn uninstall_omp_with_patch_mode(
+    global: bool,
+    patch_mode: PatchMode,
+    ctx: InitContext,
+) -> Result<()> {
     let InitContext { verbose, dry_run } = ctx;
     let path = omp_extension_path_for_scope(global)?;
 
@@ -3779,11 +3993,18 @@ pub fn uninstall_omp(global: bool, ctx: InitContext) -> Result<()> {
         return Ok(());
     }
 
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read OMP extension: {}", path.display()))?;
+    let Some(content) = read_extension_for_uninstall(&path, "OMP extension", dry_run) else {
+        return Ok(());
+    };
 
     if is_known_stock_pi_plugin(&content) {
-        warn_if_global_extension_shared(global, &path, "OMP")?;
+        if !confirm_shared_global_uninstall(global, &path, PiCompatibleAgent::Omp, patch_mode, ctx)?
+        {
+            if dry_run {
+                print_dry_run_footer();
+            }
+            return Ok(());
+        }
 
         if dry_run {
             println!("[dry-run] would remove OMP extension: {}", path.display());
@@ -3800,6 +4021,14 @@ pub fn uninstall_omp(global: bool, ctx: InitContext) -> Result<()> {
             println!("\nRestart OMP to apply changes.");
         }
     } else if looks_like_rtk_pi_plugin(&content) {
+        if dry_run {
+            println!(
+                "[dry-run] would refuse to remove OMP extension: {}",
+                path.display()
+            );
+            print_dry_run_footer();
+            return Ok(());
+        }
         anyhow::bail!(
             "OMP extension at {} contains RTK content that does not match the stock extension. Remove the file manually.",
             path.display()
@@ -7879,15 +8108,10 @@ mod tests {
         let modified = "// user-modified extension\nexport default () => {}\n";
         fs::write(&path, modified).unwrap();
 
-        let result = run_pi_mode(false, InitContext::default());
+        let result = run_pi_mode_with_patch_mode(false, PatchMode::Skip, InitContext::default());
         std::env::set_current_dir(&cwd).unwrap();
 
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("refusing to overwrite"),
-            "unexpected error: {}",
-            err
-        );
+        result.unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), modified);
     }
 
@@ -7964,13 +8188,14 @@ mod tests {
             let plugin = pi_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
             assert!(plugin.exists());
 
-            uninstall(
+            uninstall_with_patch_mode(
                 true,
                 false,
                 false,
                 false,
                 true,
                 false,
+                PatchMode::Auto,
                 InitContext::default(),
             )
             .unwrap();
@@ -8182,6 +8407,63 @@ mod tests {
     }
 
     #[test]
+    fn test_pi_uninstall_modified_extension_dry_run_is_preview() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(PI_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(&path, format!("{}\n// user modification\n", PI_PLUGIN)).unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            InitContext {
+                dry_run: true,
+                ..InitContext::default()
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        result.unwrap();
+        assert!(path.exists(), "dry-run must preserve modified extension");
+    }
+
+    #[test]
+    fn test_pi_uninstall_unreadable_extension_is_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(PI_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            InitContext::default(),
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        result.unwrap();
+        assert!(path.exists(), "unreadable extension must be left alone");
+    }
+
+    #[test]
     fn test_pi_uninstall_unrelated_content_left_alone() {
         let tmp = TempDir::new().unwrap();
         let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -8237,12 +8519,20 @@ mod tests {
             );
         }
 
-        let current_hash = integrity::compute_hash_bytes(PI_PLUGIN.trim_end().as_bytes());
+        let current_hash = integrity::compute_hash_bytes(
+            normalize_pi_plugin_line_endings(PI_PLUGIN)
+                .trim_end()
+                .as_bytes(),
+        );
         assert!(
             KNOWN_PI_PLUGIN_HASHES.contains(&current_hash.as_str()),
             "current Pi extension hash {current_hash} is missing from KNOWN_PI_PLUGIN_HASHES"
         );
         assert!(is_known_stock_pi_plugin(PI_PLUGIN));
+
+        let crlf = PI_PLUGIN.replace('\n', "\r\n");
+        assert!(is_current_pi_plugin(&crlf));
+        assert!(is_known_stock_pi_plugin(&crlf));
 
         let modified = format!("{}\n// user modification\n", PI_PLUGIN);
         assert!(!is_known_stock_pi_plugin(&modified));
@@ -8292,15 +8582,16 @@ mod tests {
 
             let plugin = omp_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
             assert!(plugin.exists(), "global OMP extension must be created");
-            assert!(global_extension_is_shared(true, &plugin, "OMP").unwrap());
+            assert!(global_extension_is_shared(true, &plugin, PiCompatibleAgent::Omp).unwrap());
 
-            uninstall(
+            uninstall_with_patch_mode(
                 true,
                 false,
                 false,
                 false,
                 false,
                 true,
+                PatchMode::Auto,
                 InitContext::default(),
             )
             .unwrap();
@@ -8315,8 +8606,8 @@ mod tests {
             let omp_path = omp_dir.join(PI_EXTENSIONS_SUBDIR).join(PI_PLUGIN_FILE);
             let pi_path = pi_plugin_path_for_scope(true).unwrap();
             assert_eq!(pi_path, omp_path);
-            assert!(global_extension_is_shared(true, &pi_path, "Pi").unwrap());
-            assert!(global_extension_is_shared(true, &omp_path, "OMP").unwrap());
+            assert!(global_extension_is_shared(true, &pi_path, PiCompatibleAgent::Pi).unwrap());
+            assert!(global_extension_is_shared(true, &omp_path, PiCompatibleAgent::Omp).unwrap());
         });
     }
 
@@ -8352,15 +8643,10 @@ mod tests {
         let modified = "// user-modified extension\nexport default () => {}\n";
         fs::write(&path, modified).unwrap();
 
-        let result = run_omp_mode(false, InitContext::default());
+        let result = run_omp_mode_with_patch_mode(false, PatchMode::Skip, InitContext::default());
         std::env::set_current_dir(&cwd).unwrap();
 
-        let err = result.unwrap_err();
-        assert!(
-            err.to_string().contains("refusing to overwrite"),
-            "unexpected error: {}",
-            err
-        );
+        result.unwrap();
         assert_eq!(fs::read_to_string(path).unwrap(), modified);
     }
 
@@ -8518,6 +8804,67 @@ mod tests {
             err
         );
         assert!(path.exists(), "modified extension must not be removed");
+    }
+
+    #[test]
+    fn test_omp_uninstall_modified_extension_dry_run_is_preview() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(OMP_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(
+            &path,
+            "// user-modified extension\nexport default (pi) => { pi.exec(\"rtk\", [\"rewrite\", cmd]) }\n",
+        )
+        .unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext {
+                dry_run: true,
+                ..InitContext::default()
+            },
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        result.unwrap();
+        assert!(path.exists(), "dry-run must preserve modified extension");
+    }
+
+    #[test]
+    fn test_omp_uninstall_unreadable_extension_is_left_alone() {
+        let tmp = TempDir::new().unwrap();
+        let _cwd_guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let dir = tmp.path().join(OMP_LOCAL_DIR).join(PI_EXTENSIONS_SUBDIR);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(PI_PLUGIN_FILE);
+        fs::write(&path, [0xff, 0xfe, 0xfd]).unwrap();
+
+        let result = uninstall(
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            InitContext::default(),
+        );
+        std::env::set_current_dir(&cwd).unwrap();
+
+        result.unwrap();
+        assert!(path.exists(), "unreadable extension must be left alone");
     }
 
     #[test]

@@ -68,6 +68,7 @@ fn omp_dry_run_stock_includes_footer_and_real_uninstall_mentions_restart() {
         "OMP install failed: {}",
         stderr(&install)
     );
+    assert!(stderr(&install).contains("share the global extension path"));
 
     let dry_run = run_rtk(
         project.path(),
@@ -86,13 +87,42 @@ fn omp_dry_run_stock_includes_footer_and_real_uninstall_mentions_restart() {
         "OMP uninstall dry-run failed: {}",
         stderr(&dry_run)
     );
-    assert!(stdout(&dry_run).contains("[dry-run] would remove OMP extension"));
+    assert!(
+        stdout(&dry_run).contains("[dry-run] would prompt before removing shared Pi/OMP extension")
+    );
     assert!(stdout(&dry_run).contains("[dry-run] Nothing written."));
+
+    let skipped = run_rtk(
+        project.path(),
+        &agent_dir,
+        &[
+            "init",
+            "--agent",
+            "omp",
+            "--global",
+            "--uninstall",
+            "--no-patch",
+        ],
+    );
+    assert!(
+        skipped.status.success(),
+        "OMP uninstall skip failed: {}",
+        stderr(&skipped)
+    );
+    assert!(stdout(&skipped).contains("Skipped removal of shared Pi/OMP extension"));
+    assert!(agent_dir.join("extensions/rtk.ts").exists());
 
     let uninstall = run_rtk(
         project.path(),
         &agent_dir,
-        &["init", "--agent", "omp", "--global", "--uninstall"],
+        &[
+            "init",
+            "--agent",
+            "omp",
+            "--global",
+            "--uninstall",
+            "--auto-patch",
+        ],
     );
     assert!(
         uninstall.status.success(),
@@ -101,10 +131,11 @@ fn omp_dry_run_stock_includes_footer_and_real_uninstall_mentions_restart() {
     );
     assert!(stdout(&uninstall).contains("Restart OMP to apply changes."));
     assert!(stderr(&uninstall).contains("share the global extension path"));
+    assert!(!agent_dir.join("extensions/rtk.ts").exists());
 }
 
 #[test]
-fn pi_dry_run_modified_extension_reports_refusal_without_error() {
+fn pi_dry_run_modified_extension_previews_confirmation_without_error() {
     let project = tempfile::tempdir().unwrap();
     let agent_dir = project.path().join("pi-agent");
     let extension_dir = project.path().join(".pi/extensions");
@@ -124,9 +155,88 @@ fn pi_dry_run_modified_extension_reports_refusal_without_error() {
         "Pi dry-run failed: {}",
         stderr(&output)
     );
-    assert!(stdout(&output).contains("[dry-run] would refuse to overwrite"));
+    assert!(stdout(&output).contains("[dry-run] would prompt before overwriting"));
     assert!(stdout(&output).contains("[dry-run] Nothing written."));
-    assert_eq!(std::fs::read_to_string(extension).unwrap(), original);
+    assert_eq!(std::fs::read_to_string(&extension).unwrap(), original);
+
+    let auto = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "pi", "--auto-patch"],
+    );
+    assert!(
+        auto.status.success(),
+        "Pi auto-patch failed: {}",
+        stderr(&auto)
+    );
+    assert_eq!(
+        std::fs::read_to_string(extension).unwrap(),
+        include_str!("../hooks/pi/rtk.ts")
+    );
+}
+
+#[test]
+fn pi_modified_uninstall_dry_run_is_non_failing_preview() {
+    let project = tempfile::tempdir().unwrap();
+    let agent_dir = project.path().join("pi-agent");
+    let extension_dir = project.path().join(".pi/extensions");
+    std::fs::create_dir_all(&extension_dir).unwrap();
+    let extension = extension_dir.join("rtk.ts");
+    std::fs::write(
+        &extension,
+        format!(
+            "{}\n// user modification\n",
+            include_str!("../hooks/pi/rtk.ts")
+        ),
+    )
+    .unwrap();
+
+    let output = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "pi", "--uninstall", "--dry-run"],
+    );
+
+    assert!(
+        output.status.success(),
+        "Pi uninstall dry-run failed: {}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains("[dry-run] would refuse to remove Pi extension"));
+    assert!(stdout(&output).contains("[dry-run] Nothing written."));
+    assert!(extension.exists());
+}
+
+#[test]
+fn omp_modified_uninstall_dry_run_is_non_failing_preview() {
+    let project = tempfile::tempdir().unwrap();
+    let agent_dir = project.path().join("omp-agent");
+    let extension_dir = project.path().join(".omp/extensions");
+    std::fs::create_dir_all(&extension_dir).unwrap();
+    let extension = extension_dir.join("rtk.ts");
+    std::fs::write(
+        &extension,
+        format!(
+            "{}\n// user modification\n",
+            include_str!("../hooks/pi/rtk.ts")
+        ),
+    )
+    .unwrap();
+
+    let output = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "omp", "--uninstall", "--dry-run"],
+    );
+
+    assert!(
+        output.status.success(),
+        "OMP uninstall dry-run failed: {}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).contains("[dry-run] would refuse to remove OMP extension"));
+    assert!(stdout(&output).contains("[dry-run] Nothing written."));
+    assert!(extension.exists());
 }
 
 #[test]
