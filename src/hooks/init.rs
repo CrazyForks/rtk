@@ -43,6 +43,12 @@ enum PiCompatibleAgent {
     Omp,
 }
 
+enum ManagedAgentState {
+    Absent,
+    Known(Vec<PiCompatibleAgent>),
+    Unknown,
+}
+
 impl PiCompatibleAgent {
     fn name(self) -> &'static str {
         match self {
@@ -79,10 +85,13 @@ impl PiCompatibleAgent {
 // when changing the extension so an untouched older install can still be
 // removed safely. Hashes are computed after normalizing CRLF to LF and
 // trimming trailing whitespace, matching the comparisons below.
-// Revisions: current (12a7cf0), 1da5793, a7cab79, 9bd6e6f, 8bc8b46,
-// f6a5451, 3e7d02d, and fb61481.
+// The history-based test below verifies that this list remains append-only
+// for every revision reachable from Git, including intermediate branch
+// revisions that may have been installed during development.
 const KNOWN_PI_PLUGIN_HASHES: &[&str] = &[
     "5e80e811e689adc9d5ae5a59d1d5702060ca0c10320fea7cffd83c659026f1c5",
+    "2cbb2a7a9081275d6eda140d9e375f6772b5c354e7fe931c554c371ad8836c6e",
+    "94e80d1a5c159ea38ba8913f7c5b9d9b5c89bf7c204f1e583bfac2ed7fc40ab9",
     "b63e3f6eeaeec23837df5a7c4024fe16dca1f8a49fb1743f8a877cc136ebc2d9",
     "c30d4f4774c59bf25b50b70ab8a7dcb1b8287074592af1598dc09962fa1c7137",
     "5ad230679294dc8dce09546fa25101fd3d0949f454cc8b72e04664fa1bd45ed7",
@@ -3531,10 +3540,10 @@ fn pi_plugin_path_for_scope(global: bool) -> Result<PathBuf> {
 
 /// Check whether a managed Pi-compatible extension can be installed.
 ///
-/// Returns `false` when the existing file is unknown and the selected policy
-/// declines or previews the overwrite; the caller can then either report the
-/// declined action or print the common dry-run footer without touching the
-/// file system. Validation runs before parent directory creation.
+/// Returns `false` when the selected policy declines or previews a skipped
+/// action; `--auto-patch --dry-run` returns `true` so the caller can preview
+/// the same directory and write actions as a real auto-patch. Validation runs
+/// before parent directory creation.
 fn validate_stock_pi_plugin_path(
     path: &Path,
     name: &str,
@@ -3556,24 +3565,32 @@ fn validate_stock_pi_plugin_path(
         };
         if !is_known_stock {
             if ctx.dry_run {
-                match patch_mode {
-                    PatchMode::Ask => println!(
-                        "[dry-run] would prompt before overwriting {}: {}",
-                        name,
-                        path.display()
-                    ),
-                    PatchMode::Auto => println!(
-                        "[dry-run] would overwrite non-stock {}: {}",
-                        name,
-                        path.display()
-                    ),
-                    PatchMode::Skip => println!(
-                        "[dry-run] would leave {} unchanged: {}",
-                        name,
-                        path.display()
-                    ),
-                }
-                return Ok(false);
+                return match patch_mode {
+                    PatchMode::Ask => {
+                        println!(
+                            "[dry-run] would prompt before overwriting {}: {}",
+                            name,
+                            path.display()
+                        );
+                        Ok(false)
+                    }
+                    PatchMode::Auto => {
+                        println!(
+                            "[dry-run] would overwrite non-stock {}: {}",
+                            name,
+                            path.display()
+                        );
+                        Ok(true)
+                    }
+                    PatchMode::Skip => {
+                        println!(
+                            "[dry-run] would leave {} unchanged: {}",
+                            name,
+                            path.display()
+                        );
+                        Ok(false)
+                    }
+                };
             }
 
             let should_overwrite = match patch_mode {
@@ -3648,25 +3665,60 @@ fn global_extension_paths_alias(
         PiCompatibleAgent::Omp => pi_plugin_path_for_scope(true)?,
     };
 
-    Ok(path == other_path)
+    Ok(canonicalize_path_for_comparison(path) == canonicalize_path_for_comparison(&other_path))
+}
+
+/// Canonicalize an extension path even when its final file has not been
+/// created yet. This detects agent directories connected by symlinks while
+/// retaining a literal-path fallback for genuinely unresolved paths.
+fn canonicalize_path_for_comparison(path: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+
+    let mut missing_components = Vec::new();
+    let mut candidate = path;
+    loop {
+        if let Ok(mut canonical) = fs::canonicalize(candidate) {
+            for component in missing_components.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+
+        let Some(file_name) = candidate.file_name() else {
+            return path.to_path_buf();
+        };
+        missing_components.push(file_name.to_os_string());
+
+        let Some(parent) = candidate.parent() else {
+            return path.to_path_buf();
+        };
+        if parent == candidate {
+            return path.to_path_buf();
+        }
+        candidate = parent;
+    }
 }
 
 fn shared_agent_state_path(path: &Path) -> PathBuf {
     path.with_file_name(PI_AGENT_STATE_FILE)
 }
 
-fn read_managed_agents(path: &Path) -> Result<Option<Vec<PiCompatibleAgent>>> {
+fn read_managed_agents(path: &Path) -> Result<ManagedAgentState> {
     let state_path = shared_agent_state_path(path);
     let content = match fs::read_to_string(&state_path) {
         Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ManagedAgentState::Absent);
+        }
         Err(error) => {
             eprintln!(
                 "[warn] RTK extension ownership state at {} could not be read; treating ownership as unknown: {}",
                 state_path.display(),
                 error
             );
-            return Ok(None);
+            return Ok(ManagedAgentState::Unknown);
         }
     };
     let mut agents = Vec::new();
@@ -3691,7 +3743,7 @@ fn read_managed_agents(path: &Path) -> Result<Option<Vec<PiCompatibleAgent>>> {
             "[warn] RTK extension ownership state at {} contains unknown entries; treating ownership as unknown",
             state_path.display()
         );
-        return Ok(None);
+        return Ok(ManagedAgentState::Unknown);
     }
 
     if agents.is_empty() {
@@ -3699,10 +3751,10 @@ fn read_managed_agents(path: &Path) -> Result<Option<Vec<PiCompatibleAgent>>> {
             "[warn] RTK extension ownership state at {} is empty; treating ownership as unknown",
             state_path.display()
         );
-        return Ok(None);
+        return Ok(ManagedAgentState::Unknown);
     }
 
-    Ok(Some(agents))
+    Ok(ManagedAgentState::Known(agents))
 }
 
 fn record_managed_agent(
@@ -3717,13 +3769,22 @@ fn record_managed_agent(
     }
 
     let state_path = shared_agent_state_path(path);
-    let mut agents = if extension_was_present {
-        read_managed_agents(path)?.unwrap_or_default()
-    } else {
+    let mut agents = if !extension_was_present {
         // If the extension was absent before this install, any remaining
         // sidecar describes a file that no longer exists and must not be
         // carried into the new installation.
         Vec::new()
+    } else {
+        match read_managed_agents(path)? {
+            ManagedAgentState::Absent => Vec::new(),
+            ManagedAgentState::Known(agents) => agents,
+            ManagedAgentState::Unknown => {
+                // Do not turn unknown ownership into a current-agent-only
+                // record. The extension was installed successfully, but the
+                // existing state must remain intact for the fallback path.
+                return Ok(());
+            }
+        }
     };
     if !agents.contains(&agent) {
         agents.push(agent);
@@ -3787,8 +3848,10 @@ fn global_extension_is_shared(global: bool, path: &Path, agent: PiCompatibleAgen
 
     let other_agent = agent.other();
     match read_managed_agents(path)? {
-        Some(agents) => Ok(agents.contains(&other_agent)),
-        None => global_agent_configuration_is_present(other_agent),
+        ManagedAgentState::Known(agents) => Ok(agents.contains(&other_agent)),
+        ManagedAgentState::Absent | ManagedAgentState::Unknown => {
+            global_agent_configuration_is_present(other_agent)
+        }
     }
 }
 
@@ -5915,6 +5978,7 @@ fn uninstall_copilot_global_at(copilot_dir: &Path, ctx: InitContext) -> Result<V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::TempDir;
 
     #[test]
@@ -8794,22 +8858,6 @@ mod tests {
             .iter()
             .all(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())));
 
-        for historical_hash in [
-            "5e80e811e689adc9d5ae5a59d1d5702060ca0c10320fea7cffd83c659026f1c5",
-            "b63e3f6eeaeec23837df5a7c4024fe16dca1f8a49fb1743f8a877cc136ebc2d9",
-            "c30d4f4774c59bf25b50b70ab8a7dcb1b8287074592af1598dc09962fa1c7137",
-            "5ad230679294dc8dce09546fa25101fd3d0949f454cc8b72e04664fa1bd45ed7",
-            "be251e44747e6d09e5ca56ecaeddd8f4861c35a57500cd8b2bf9c39afe5795e8",
-            "eb56dd08b8d5f4704906d037d70b357d84d827abe1063135cc7c998efe6cf7f2",
-            "628308173ae41c488b76bcf90eafbd4c0c72435927645d81cdbec652eac4b107",
-            "3eb16108f51a29c2a62a453d5c97a6ea2da8aea1061da34c50fdcfaa32dc0ff7",
-        ] {
-            assert!(
-                KNOWN_PI_PLUGIN_HASHES.contains(&historical_hash),
-                "historical Pi extension hash {historical_hash} was removed"
-            );
-        }
-
         let current_hash = integrity::compute_hash_bytes(
             normalize_pi_plugin_line_endings(PI_PLUGIN)
                 .trim_end()
@@ -8827,6 +8875,68 @@ mod tests {
 
         let modified = format!("{}\n// user modification\n", PI_PLUGIN);
         assert!(!is_known_stock_pi_plugin(&modified));
+    }
+
+    #[test]
+    fn test_all_git_pi_plugin_revisions_are_allowlisted() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        if !manifest_dir.join(".git").exists() {
+            // Source archives do not contain Git history. CI checks out the
+            // repository with full history so this guard remains active there.
+            return;
+        }
+
+        let revisions = Command::new("git")
+            .current_dir(manifest_dir)
+            .args([
+                "rev-list",
+                "--all",
+                "--full-history",
+                "--",
+                "hooks/pi/rtk.ts",
+            ])
+            .output()
+            .expect("git must be available to verify Pi extension history");
+        assert!(
+            revisions.status.success(),
+            "git rev-list failed: {}",
+            String::from_utf8_lossy(&revisions.stderr)
+        );
+
+        let mut commits: Vec<String> = String::from_utf8(revisions.stdout)
+            .expect("git revision list must be UTF-8")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        commits.push("HEAD".to_owned());
+        commits.sort();
+        commits.dedup();
+
+        for commit in commits {
+            let object = format!("{commit}:hooks/pi/rtk.ts");
+            let file = Command::new("git")
+                .current_dir(manifest_dir)
+                .args(["show", object.as_str()])
+                .output()
+                .expect("git must be available to inspect Pi extension history");
+            if !file.status.success() {
+                // A revision that deletes the file is not an installable stock
+                // extension revision.
+                continue;
+            }
+
+            let content = String::from_utf8(file.stdout)
+                .expect("Pi extension history must contain UTF-8 source");
+            let hash = integrity::compute_hash_bytes(
+                normalize_pi_plugin_line_endings(&content)
+                    .trim_end()
+                    .as_bytes(),
+            );
+            assert!(
+                KNOWN_PI_PLUGIN_HASHES.contains(&hash.as_str()),
+                "Pi extension revision {commit} has unallowlisted hash {hash}"
+            );
+        }
     }
 
     #[test]
