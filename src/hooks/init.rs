@@ -17,9 +17,9 @@ use super::constants::{
     DROID_EXECUTE_MATCHER, DROID_HOME_ENV, DROID_HOOKS_FILE, DROID_HOOKS_SUBDIR,
     DROID_HOOK_COMMAND, DROID_SETTINGS_FILE, GEMINI_HOOK_FILE, HERMES_DIR, HERMES_PLUGINS_SUBDIR,
     HERMES_PLUGIN_INIT_FILE, HERMES_PLUGIN_MANIFEST_FILE, HERMES_PLUGIN_NAME, HOOKS_JSON,
-    HOOKS_SUBDIR, OMP_DIR, OMP_LOCAL_DIR, PI_CODING_AGENT_DIR_ENV, PI_DIR, PI_EXTENSIONS_SUBDIR,
-    PI_LOCAL_DIR, PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE, SETTINGS_JSON,
-    VIBE_BASH_MATCH, VIBE_DIR, VIBE_HOOKS_FILE, VIBE_HOOK_COMMAND, VIBE_HOOK_NAME,
+    HOOKS_SUBDIR, OMP_DIR, OMP_LOCAL_DIR, PI_AGENT_STATE_FILE, PI_CODING_AGENT_DIR_ENV, PI_DIR,
+    PI_EXTENSIONS_SUBDIR, PI_LOCAL_DIR, PI_PLUGIN_FILE, PRE_TOOL_USE_KEY, REWRITE_HOOK_FILE,
+    SETTINGS_JSON, VIBE_BASH_MATCH, VIBE_DIR, VIBE_HOOKS_FILE, VIBE_HOOK_COMMAND, VIBE_HOOK_NAME,
     VIBE_PROMPTS_SUBDIR, VIBE_PROMPT_FILE,
 };
 use super::integrity;
@@ -36,7 +36,6 @@ const PI_PLUGIN: &str = include_str!("../../hooks/pi/rtk.ts");
 // both the current `pi.exec` call and older stock revisions that imported
 // `exec` locally before invoking it.
 const PI_PLUGIN_REWRITE_MARKER: &str = "exec(\"rtk\", [\"rewrite\"";
-const PI_AGENT_STATE_SUFFIX: &str = ".rtk-agents";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PiCompatibleAgent {
@@ -419,11 +418,11 @@ fn write_if_changed(path: &Path, content: &str, name: &str, ctx: InitContext) ->
     write_if_changed_internal(path, content, name, ctx, false)
 }
 
-/// Variant used for the Pi-compatible extension. A protected extension that
-/// cannot be decoded is still replaceable after the caller's policy allows it
-/// (for example, `--auto-patch`), so a read error is treated like differing
-/// content instead of preventing recovery.
-fn write_if_changed_allow_unreadable(
+/// Variant used for protected RTK files. A file that cannot be decoded is
+/// still replaceable after the caller's policy allows it (for example,
+/// `--auto-patch`), so a read error is treated like differing content instead
+/// of preventing recovery.
+fn write_if_changed_allow_read_error(
     path: &Path,
     content: &str,
     name: &str,
@@ -437,13 +436,13 @@ fn write_if_changed_internal(
     content: &str,
     name: &str,
     ctx: InitContext,
-    allow_unreadable: bool,
+    allow_read_error: bool,
 ) -> Result<bool> {
     let InitContext { verbose, dry_run } = ctx;
     if path.exists() {
         let existing = match fs::read_to_string(path) {
             Ok(existing) => existing,
-            Err(_) if allow_unreadable => {
+            Err(_) if allow_read_error => {
                 if dry_run {
                     println!("[dry-run] would update {}: {}", name, path.display());
                     if verbose > 0 {
@@ -3653,35 +3652,56 @@ fn global_extension_paths_alias(
 }
 
 fn shared_agent_state_path(path: &Path) -> PathBuf {
-    let mut state_name = path
-        .file_name()
-        .map(|name| name.to_os_string())
-        .unwrap_or_else(|| OsString::from(PI_PLUGIN_FILE));
-    state_name.push(PI_AGENT_STATE_SUFFIX);
-    path.with_file_name(state_name)
+    path.with_file_name(PI_AGENT_STATE_FILE)
 }
 
 fn read_managed_agents(path: &Path) -> Result<Option<Vec<PiCompatibleAgent>>> {
     let state_path = shared_agent_state_path(path);
-    if !state_path.exists() {
+    let content = match fs::read_to_string(&state_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            eprintln!(
+                "[warn] RTK extension ownership state at {} could not be read; treating ownership as unknown: {}",
+                state_path.display(),
+                error
+            );
+            return Ok(None);
+        }
+    };
+    let mut agents = Vec::new();
+    let mut has_invalid_entry = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match PiCompatibleAgent::from_state_name(line) {
+            Some(agent) => {
+                if !agents.contains(&agent) {
+                    agents.push(agent);
+                }
+            }
+            None => has_invalid_entry = true,
+        }
+    }
+
+    if has_invalid_entry {
+        eprintln!(
+            "[warn] RTK extension ownership state at {} contains unknown entries; treating ownership as unknown",
+            state_path.display()
+        );
         return Ok(None);
     }
 
-    let content = fs::read_to_string(&state_path).with_context(|| {
-        format!(
-            "Failed to read RTK extension ownership state: {}",
+    if agents.is_empty() {
+        eprintln!(
+            "[warn] RTK extension ownership state at {} is empty; treating ownership as unknown",
             state_path.display()
-        )
-    })?;
-    let mut agents = Vec::new();
-    for agent in content
-        .lines()
-        .filter_map(|line| PiCompatibleAgent::from_state_name(line.trim()))
-    {
-        if !agents.contains(&agent) {
-            agents.push(agent);
-        }
+        );
+        return Ok(None);
     }
+
     Ok(Some(agents))
 }
 
@@ -3689,6 +3709,7 @@ fn record_managed_agent(
     global: bool,
     path: &Path,
     agent: PiCompatibleAgent,
+    extension_was_present: bool,
     ctx: InitContext,
 ) -> Result<()> {
     if !global_extension_paths_alias(global, path, agent)? {
@@ -3696,7 +3717,14 @@ fn record_managed_agent(
     }
 
     let state_path = shared_agent_state_path(path);
-    let mut agents = read_managed_agents(path)?.unwrap_or_default();
+    let mut agents = if extension_was_present {
+        read_managed_agents(path)?.unwrap_or_default()
+    } else {
+        // If the extension was absent before this install, any remaining
+        // sidecar describes a file that no longer exists and must not be
+        // carried into the new installation.
+        Vec::new()
+    };
     if !agents.contains(&agent) {
         agents.push(agent);
     }
@@ -3709,7 +3737,7 @@ fn record_managed_agent(
             .collect::<Vec<_>>()
             .join("\n")
     );
-    write_if_changed(&state_path, &content, "RTK extension ownership state", ctx)?;
+    write_if_changed_allow_read_error(&state_path, &content, "RTK extension ownership state", ctx)?;
     Ok(())
 }
 
@@ -3749,38 +3777,27 @@ fn remove_managed_agent_state(
 /// agents through `PI_CODING_AGENT_DIR`.
 ///
 /// The ownership sidecar records which agents RTK installed for a relocated
-/// shared path. Configuration-directory checks remain as a fallback for
-/// installs performed before the sidecar existed or by another tool.
+/// shared path. Home-level configuration-directory checks remain as a
+/// fallback for installs performed before the sidecar existed or by another
+/// tool.
 fn global_extension_is_shared(global: bool, path: &Path, agent: PiCompatibleAgent) -> Result<bool> {
     if !global_extension_paths_alias(global, path, agent)? {
         return Ok(false);
     }
 
     let other_agent = agent.other();
-    if read_managed_agents(path)?.is_some_and(|agents| agents.contains(&other_agent)) {
-        return Ok(true);
-    }
-
-    match other_agent {
-        PiCompatibleAgent::Pi => pi_configuration_is_present(),
-        PiCompatibleAgent::Omp => omp_configuration_is_present(),
+    match read_managed_agents(path)? {
+        Some(agents) => Ok(agents.contains(&other_agent)),
+        None => global_agent_configuration_is_present(other_agent),
     }
 }
 
-fn pi_configuration_is_present() -> Result<bool> {
-    if Path::new(PI_LOCAL_DIR).is_dir() {
-        return Ok(true);
-    }
-
-    Ok(resolve_home_subdir(PI_LOCAL_DIR)?.is_dir())
-}
-
-fn omp_configuration_is_present() -> Result<bool> {
-    if Path::new(OMP_LOCAL_DIR).is_dir() {
-        return Ok(true);
-    }
-
-    Ok(resolve_home_subdir(OMP_LOCAL_DIR)?.is_dir())
+fn global_agent_configuration_is_present(agent: PiCompatibleAgent) -> Result<bool> {
+    let config_dir = match agent {
+        PiCompatibleAgent::Pi => PI_LOCAL_DIR,
+        PiCompatibleAgent::Omp => OMP_LOCAL_DIR,
+    };
+    Ok(resolve_home_subdir(config_dir)?.is_dir())
 }
 
 fn warn_if_global_extension_shared_on_install(
@@ -3991,6 +4008,7 @@ pub fn run_pi_mode_with_patch_mode(
 ) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
     let plugin_path = pi_plugin_path_for_scope(global)?;
+    let extension_was_present = plugin_path.exists();
 
     warn_if_global_extension_shared_on_install(global, &plugin_path, PiCompatibleAgent::Pi)?;
 
@@ -4018,8 +4036,14 @@ pub fn run_pi_mode_with_patch_mode(
     }
 
     let installed =
-        write_if_changed_allow_unreadable(&plugin_path, PI_PLUGIN, "Pi extension", ctx)?;
-    record_managed_agent(global, &plugin_path, PiCompatibleAgent::Pi, ctx)?;
+        write_if_changed_allow_read_error(&plugin_path, PI_PLUGIN, "Pi extension", ctx)?;
+    record_managed_agent(
+        global,
+        &plugin_path,
+        PiCompatibleAgent::Pi,
+        extension_was_present,
+        ctx,
+    )?;
 
     if dry_run {
         print_dry_run_footer();
@@ -4150,6 +4174,7 @@ pub fn run_omp_mode_with_patch_mode(
 ) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
     let path = omp_extension_path_for_scope(global)?;
+    let extension_was_present = path.exists();
 
     warn_if_global_extension_shared_on_install(global, &path, PiCompatibleAgent::Omp)?;
 
@@ -4177,8 +4202,14 @@ pub fn run_omp_mode_with_patch_mode(
     }
 
     let installed =
-        write_if_changed_allow_unreadable(path.as_path(), PI_PLUGIN, "OMP extension", ctx)?;
-    record_managed_agent(global, &path, PiCompatibleAgent::Omp, ctx)?;
+        write_if_changed_allow_read_error(path.as_path(), PI_PLUGIN, "OMP extension", ctx)?;
+    record_managed_agent(
+        global,
+        &path,
+        PiCompatibleAgent::Omp,
+        extension_was_present,
+        ctx,
+    )?;
 
     if dry_run {
         print_dry_run_footer();
@@ -8764,6 +8795,7 @@ mod tests {
             .all(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())));
 
         for historical_hash in [
+            "5e80e811e689adc9d5ae5a59d1d5702060ca0c10320fea7cffd83c659026f1c5",
             "b63e3f6eeaeec23837df5a7c4024fe16dca1f8a49fb1743f8a877cc136ebc2d9",
             "c30d4f4774c59bf25b50b70ab8a7dcb1b8287074592af1598dc09962fa1c7137",
             "5ad230679294dc8dce09546fa25101fd3d0949f454cc8b72e04664fa1bd45ed7",
@@ -8878,16 +8910,31 @@ mod tests {
             let pi_path = pi_plugin_path_for_scope(true).unwrap();
             assert_eq!(pi_path, omp_path);
             fs::create_dir_all(omp_path.parent().unwrap()).unwrap();
+            fs::write(&omp_path, PI_PLUGIN).unwrap();
             record_managed_agent(
                 true,
                 &omp_path,
                 PiCompatibleAgent::Pi,
+                true,
                 InitContext::default(),
             )
             .unwrap();
             assert!(global_extension_is_shared(true, &omp_path, PiCompatibleAgent::Omp).unwrap());
 
             fs::create_dir_all(OMP_LOCAL_DIR).unwrap();
+            assert!(
+                !global_extension_is_shared(true, &pi_path, PiCompatibleAgent::Pi).unwrap(),
+                "a definitive Pi-only sidecar must override an unrelated project-local OMP directory"
+            );
+
+            record_managed_agent(
+                true,
+                &omp_path,
+                PiCompatibleAgent::Omp,
+                true,
+                InitContext::default(),
+            )
+            .unwrap();
             assert!(global_extension_is_shared(true, &pi_path, PiCompatibleAgent::Pi).unwrap());
         });
         std::env::set_current_dir(&cwd).unwrap();

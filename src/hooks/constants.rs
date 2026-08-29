@@ -36,6 +36,8 @@ pub const PI_DIR: &str = ".pi/agent";
 pub const PI_LOCAL_DIR: &str = ".pi";
 pub const PI_EXTENSIONS_SUBDIR: &str = "extensions";
 pub const PI_PLUGIN_FILE: &str = "rtk.ts";
+/// Hidden ownership state stored beside the shared Pi/OMP extension.
+pub const PI_AGENT_STATE_FILE: &str = ".rtk-agents";
 pub const PI_CODING_AGENT_DIR_ENV: &str = "PI_CODING_AGENT_DIR";
 
 /// Oh My Pi (OMP) home subdirectory (`$HOME/.omp/agent`) and project
