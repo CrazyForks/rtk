@@ -88,9 +88,14 @@ pub(crate) fn parse_major_version(version_output: &str) -> u32 {
     // Handles:
     //   "golangci-lint version 1.59.1"
     //   "golangci-lint has version 2.10.0 built with ..."
+    //   "golangci-lint has version v1.64.8 built with ..."
+    //
+    // The `v` prefix varies with how the binary was built, and reading a v2 as a v1
+    // would send it `--out-format=json`, a flag v2 removed.
     for word in version_output.split_whitespace() {
-        if let Some(major) = word.split('.').next().and_then(|s| s.parse::<u32>().ok()) {
-            if word.contains('.') {
+        let version = word.strip_prefix('v').unwrap_or(word);
+        if let Some(major) = version.split('.').next().and_then(|s| s.parse::<u32>().ok()) {
+            if version.contains('.') {
                 return major;
             }
         }
@@ -458,6 +463,24 @@ mod tests {
     fn test_parse_version_v2_format() {
         assert_eq!(
             parse_major_version("golangci-lint has version 2.10.0 built with go1.26.0 from 95dcb68a on 2026-02-17T13:05:51Z"),
+            2
+        );
+    }
+
+    /// A `go install` build of v1 prints the version `v`-prefixed while the same
+    /// build of v2 does not, so neither spelling may decide the major version.
+    #[test]
+    fn test_parse_version_tolerates_v_prefix() {
+        assert_eq!(
+            parse_major_version(
+                "golangci-lint has version v1.64.8 built with go1.27.0 from (unknown)"
+            ),
+            1
+        );
+        assert_eq!(
+            parse_major_version(
+                "golangci-lint has version v2.13.2 built with go1.27.0 from (unknown)"
+            ),
             2
         );
     }
