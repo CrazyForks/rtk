@@ -391,6 +391,7 @@ fn compact_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::tracking::estimate_tokens;
 
     #[test]
     fn test_filter_golangci_no_issues() {
@@ -702,22 +703,61 @@ mod tests {
         }
     }
 
-    fn count_tokens(text: &str) -> usize {
-        text.split_whitespace().count()
+    #[test]
+    fn test_filter_real_v2_clean_json() {
+        let raw = include_str!("../../../tests/fixtures/golangci_v2_clean_raw.json");
+        assert_eq!(
+            filter_golangci_json(raw.lines().next().unwrap_or(""), 2),
+            "golangci-lint: No issues found"
+        );
     }
 
     #[test]
-    fn test_golangci_v2_token_savings() {
-        let raw = include_str!("../../../tests/fixtures/golangci_v2_json.txt");
+    fn test_filter_real_v2_issues_json() {
+        let raw = include_str!("../../../tests/fixtures/golangci_v2_issues_raw.json");
+        let filtered = filter_golangci_json(raw.lines().next().unwrap_or(""), 2);
 
-        let filtered = filter_golangci_json(raw, 2);
-        let savings = 100.0 - (count_tokens(&filtered) as f64 / count_tokens(raw) as f64 * 100.0);
+        assert!(filtered.contains("golangci-lint: 6 issues in 1 files"));
+        assert!(filtered.contains("errcheck (3x)"));
+        assert!(filtered.contains("ineffassign (3x)"));
+        assert!(filtered.contains("main.go"));
+    }
 
-        assert!(
-            savings >= 60.0,
-            "Expected ≥60% token savings, got {:.1}%\nFiltered output:\n{}",
-            savings,
-            filtered
-        );
+    #[test]
+    fn test_real_v2_issues_token_savings() {
+        let raw = include_str!("../../../tests/fixtures/golangci_v2_issues_raw.json");
+        // v2 puts the JSON on the first line and may print text after it; measure
+        // against the slice the filter is actually handed, not the whole file.
+        let json = raw.lines().next().unwrap_or("");
+        let filtered = filter_golangci_json(json, 2);
+        // golangci-lint emits its JSON on a single line, so whitespace-word counting
+        // measures indentation rather than content. Use the estimator RTK bills with.
+        let raw_tokens = estimate_tokens(json) as f64;
+        let filtered_tokens = estimate_tokens(&filtered) as f64;
+        let savings = 100.0 - (filtered_tokens / raw_tokens * 100.0);
+
+        assert!(savings >= 60.0, "expected >=60% savings, got {:.1}%", savings);
+    }
+
+    /// The filter always has something to say about its input. Whether that is worth
+    /// printing is the guard's call, not an empty return here.
+    #[test]
+    fn test_filter_never_silent_on_go127_load_error() {
+        let stderr = include_str!("../../../tests/fixtures/golangci_v1_go127_error_stderr.txt");
+
+        for (label, input) in [
+            ("empty stdout", ""),
+            ("whitespace", "   \n  "),
+            ("error text on stdout", stderr),
+            ("truncated json", "{\"Issues\": ["),
+        ] {
+            for version in [1, 2] {
+                let filtered = filter_golangci_json(input, version);
+                assert!(
+                    !filtered.trim().is_empty(),
+                    "filter went silent on {label} (v{version})"
+                );
+            }
+        }
     }
 }
