@@ -1609,10 +1609,9 @@ diff --git a/b.rs b/b.rs
         // design, so its savings come only from dropped metadata. Measured on
         // this corpus (metadata-heavy streams) that is 52-87% per fixture;
         // on content-heavy single-file diffs it can fall to single digits
-        // (~4% on this branch's own self-diff). The 60% floor in
-        // cli-testing.md is therefore not guaranteed by construction — the
-        // fidelity-filter exemption is escalated on the ticket as a
-        // maintainer decision. What must always hold: the output is never
+        // (~4% on this branch's own self-diff). That clears the 20%
+        // admission bar in CONTRIBUTING.md on realistic streams but is not
+        // guaranteed by construction. What must always hold: the output is never
         // larger than the input (the `never_worse` guard's contract,
         // verified here at the filter level). Percentages above are by this
         // test's whitespace-token metric; the runtime guard uses
