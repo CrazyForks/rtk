@@ -94,17 +94,15 @@ pub fn run_stdin(_verbose: u8) -> Result<()> {
     Ok(())
 }
 
-/// Filter a piped stream: strip ANSI (a `git diff --color` stream otherwise
-/// matches nothing and condenses to silence), parse strictly, and apply the
-/// never-worse guard. `None` means the caller must emit its exact input
+/// Filter a piped stream: parse strictly (the parser reads structure through
+/// an ANSI-stripped view, so a `git diff --color` stream parses instead of
+/// condensing to silence, while content lines keep their bytes) and apply
+/// the never-worse guard. `None` means the caller must emit its exact input
 /// bytes — including for non-UTF-8 input, where filtering would rewrite the
 /// user's content bytes to U+FFFD (byte fidelity outranks savings here).
 fn condense_stdin(bytes: &[u8]) -> Option<String> {
     let input = std::str::from_utf8(bytes).ok()?;
-    let cleaned = crate::core::utils::strip_ansi(input);
-    let condensed = condense_unified_diff_strict(&cleaned)?;
-    // The never_worse contract, against what the user would otherwise get —
-    // the original input, not the ANSI-stripped intermediate.
+    let condensed = condense_unified_diff_strict(input)?;
     if crate::core::tracking::estimate_tokens(&condensed)
         <= crate::core::tracking::estimate_tokens(input)
     {
@@ -217,6 +215,34 @@ struct FileEntry {
     /// place (git's extended header precedes them) but flushes one that
     /// already carries hunks (plain `diff -u` concatenates files that way).
     saw_hunk: bool,
+    /// Whether this section's `---`/`+++` names carry git's `a/`/`b/`
+    /// prefixes. `Some` when a `diff --git X Y` line settled it (X == Y is
+    /// `--no-prefix`); `None` for sections opened by a header pair alone,
+    /// where the pair itself decides.
+    prefixed: Option<bool>,
+}
+
+/// The line as the parser reads it for structural decisions: ANSI escapes
+/// removed (a `--color` stream wraps every line, marker included) and a
+/// trailing CR dropped (CRLF streams). Content lines are pushed from the raw
+/// line, never from this view, so escapes and CRs that are part of the
+/// user's content survive verbatim.
+fn structural(raw: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let view = if raw.contains('\x1b') {
+        Cow::Owned(crate::core::utils::strip_ansi(raw))
+    } else {
+        Cow::Borrowed(raw)
+    };
+    match view {
+        Cow::Borrowed(v) => Cow::Borrowed(v.strip_suffix('\r').unwrap_or(v)),
+        Cow::Owned(mut v) => {
+            if v.ends_with('\r') {
+                v.pop();
+            }
+            Cow::Owned(v)
+        }
+    }
 }
 
 impl FileEntry {
@@ -254,20 +280,27 @@ fn is_mbox_from(line: &str) -> bool {
 }
 
 /// `--- <name>` / `+++ <name>` → display name: the `+++` side unless it is
-/// `/dev/null` (a deletion), then the `--- ` side. One `b/`/`a/` prefix is
-/// stripped (exactly once — `b/b/x` names a file in a `b/` directory), and
-/// anything after the first tab (`diff -u` timestamps, svn `(working copy)`)
-/// is dropped.
-fn header_name(minus: &str, plus: &str) -> String {
-    fn clean(side: &str, prefix: &str) -> String {
-        let side = side.split('\t').next().unwrap_or(side);
-        side.strip_prefix(prefix).unwrap_or(side).to_string()
-    }
-    let p = clean(plus, "b/");
-    if p == "/dev/null" {
+/// `/dev/null` (a deletion), then the `--- ` side. Anything after the first
+/// tab (`diff -u` timestamps, svn `(working copy)`) is dropped. The `a/`/`b/`
+/// prefixes are stripped exactly once (`b/b/x` names a file in a `b/`
+/// directory) and only in a prefixed stream: `prefixed` comes from the
+/// section's `diff --git` line when it had one, else from the pair itself —
+/// `--no-prefix` repeats one path (`b/x b/x`), a prefixed pair never does.
+fn header_name(minus: &str, plus: &str, prefixed: Option<bool>) -> String {
+    let minus = minus.split('\t').next().unwrap_or(minus);
+    let plus = plus.split('\t').next().unwrap_or(plus);
+    let prefixed = prefixed.unwrap_or(minus != plus);
+    let clean = |side: &str, prefix: &str| -> String {
+        if prefixed {
+            side.strip_prefix(prefix).unwrap_or(side).to_string()
+        } else {
+            side.to_string()
+        }
+    };
+    if plus == "/dev/null" {
         clean(minus, "a/")
     } else {
-        p
+        clean(plus, "b/")
     }
 }
 
@@ -321,11 +354,14 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<usize>, usize)> {
 ///    zero, so a `@@` or file header arriving while a hunk is open is itself
 ///    budget-owed → the invalid-prefix arm returns `None`.) The
 ///    `\ No newline at end of file` marker consumes no budget but is kept as
-///    content — in-hunk (old side) or immediately after the budget closes
-///    (new side) — because it is the only witness of a newline-only change.
+///    content — in-hunk (old side) or on the line right after the budget
+///    closes (new side) — because it is the only witness of a newline-only
+///    change. A `\` line anywhere else is prose.
 /// 2. An mbox `From <sha>` separator resets to the prose prologue.
 /// 3. `diff --git` / `diff --cc` opens a file section (git extended headers
-///    such as `rename`/`Binary files`/mode lines annotate it).
+///    such as `rename`/`Binary files`/mode lines annotate it). `diff --git
+///    X Y` with X == Y marks a `--no-prefix` stream, whose header names keep
+///    their leading `a/`/`b/` (they are directories there, not prefixes).
 /// 4. A `--- X` line immediately followed by `+++ Y` is a file header: it
 ///    renames a still-hunkless section in place, or — when the line after
 ///    `+++ Y` opens a hunk, as every real producer's does — opens a new
@@ -358,13 +394,23 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<usize>, usize)> {
 /// 8. Any other `+`/`-` marked line outside a hunk is evidence of a stale
 ///    or under-declared budget → `None`, with one exemption: inside an mbox
 ///    message region (rule 2 separator to that patch's first file header),
-///    column-0 marked lines are commit prose — the format-patch `---`
-///    message/diffstat separator, bullet lists, quoted hunks. The
-///    stream-start prologue earns no such exemption: a marked line before
-///    the first file header of a never-mbox stream is a head-truncated
-///    stream's lost content, and must fall back raw rather than be dropped
-///    as prose.
+///    up to format-patch's diffstat, column-0 marked lines are commit
+///    prose — bullet lists, quoted hunks, the `---` separator, version
+///    notes between it and the diffstat. From the first diffstat line
+///    (` <path> | N +-`) on, nothing but diffstat precedes the file header,
+///    so a marked line there is a hand-edited or reflowed patch's lost
+///    content and falls back raw. The stream-start prologue earns no
+///    exemption at all: a marked line before the first file header of a
+///    never-mbox stream is a head-truncated stream's lost content. (Bound:
+///    a `--no-stat` patch has no diffstat, so its tolerance runs to the
+///    file header; and a message whose own prose has a space-indented
+///    ` | ` line followed by column-0 marked lines falls back raw — noise,
+///    not loss.)
 /// 9. Everything else is prose and is dropped.
+///
+/// Every rule reads the line through [`structural`] (ANSI- and CR-stripped);
+/// content is pushed from the raw line, so a `--color` stream parses while
+/// escapes that are part of the user's content survive verbatim.
 fn condense_unified_diff_strict(diff: &str) -> Option<String> {
     let mut lines: Vec<&str> = diff.split('\n').collect();
     if lines.last() == Some(&"") {
@@ -374,13 +420,22 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
     let mut entries: Vec<FileEntry> = Vec::new();
     let mut current: Option<FileEntry> = None;
     let mut hunk: Option<HunkBudget> = None;
-    // Stream start is the prologue: mbox headers, commit message, diffstat.
-    let mut in_prologue = true;
+    // Index of the line right after the last hunk's budget closed: the only
+    // place a new-side `\ No newline` marker can legitimately sit (rule 1b).
+    let mut closed_at: Option<usize> = None;
     // Signature tolerance (rule 7) is earned by an mbox separator.
     let mut seen_mbox_from = false;
     // True from a `From <sha>` separator to that patch's first file header:
     // the only region where column-0 prose can imitate the rule-6 facts.
     let mut in_mbox_message = false;
+    // True once the mbox message region reached format-patch's diffstat
+    // (` <path> | N +-` lines): nothing but more diffstat sits between it
+    // and the file header, so a column-0 marked line there is lost content,
+    // not prose. Keyed on the diffstat rather than the `---` separator
+    // because version notes (`Changes in v2:` + bullets) conventionally go
+    // between the two, and on the per-file ` | ` shape rather than the
+    // `N files changed` summary because the latter is localized.
+    let mut past_diffstat = false;
 
     fn flush(entries: &mut Vec<FileEntry>, current: &mut Option<FileEntry>) {
         if let Some(e) = current.take() {
@@ -393,9 +448,10 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
     let mut i = 0;
     while i < lines.len() {
         let raw = lines[i];
-        // Structural decisions ignore a trailing CR (CRLF streams); content
-        // lines are pushed raw so the user's bytes survive verbatim.
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        // Structural decisions read the ANSI-stripped, CR-stripped view;
+        // content lines are pushed raw so the user's bytes survive verbatim.
+        let view = structural(raw);
+        let line: &str = &view;
         i += 1;
 
         // Rule 1: the open hunk's budget owns the line.
@@ -445,15 +501,21 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
             }
             if h.exhausted() {
                 hunk = None;
+                closed_at = Some(i);
             }
             continue;
         }
 
-        // Rule 1b: the new-side no-newline marker lands right after its
-        // hunk's budget closed; it still belongs to that hunk's section.
+        // Rule 1b: the new-side no-newline marker lands on the line right
+        // after its hunk's budget closed; it still belongs to that hunk's
+        // section. Anywhere else a `\` line is prose (rule 9): the marker's
+        // text is localized by GNU diff, so position, not value, decides.
         if line.starts_with('\\') {
-            if let Some(e) = current.as_mut().filter(|e| e.saw_hunk) {
-                e.changes.push(raw.to_string());
+            if closed_at == Some(i - 1) {
+                if let Some(e) = current.as_mut() {
+                    e.changes.push(raw.to_string());
+                }
+                closed_at = Some(i);
             }
             continue;
         }
@@ -461,9 +523,9 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
         // Rule 2: mbox patch separator → back to the prose prologue.
         if is_mbox_from(line) {
             flush(&mut entries, &mut current);
-            in_prologue = true;
             seen_mbox_from = true;
             in_mbox_message = true;
+            past_diffstat = false;
             continue;
         }
 
@@ -474,16 +536,30 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
             .or_else(|| line.strip_prefix("diff --combined "))
         {
             flush(&mut entries, &mut current);
-            in_prologue = false;
             in_mbox_message = false;
+            // `diff --git X Y`: with prefixes X=a/P, Y=b/P' (never equal);
+            // `--no-prefix` (or `diff.noprefix`) repeats one path. That
+            // equality, not the user's config, decides whether the header
+            // pair's `a/`/`b/` are prefixes to strip or directories to keep.
+            // `diff --cc`/`--combined` carry a single path, so the check is
+            // confined to the two-path form (a file named `a a` is one path).
+            let mid = rest.len() / 2;
+            let same_path_twice = line.starts_with("diff --git ")
+                && rest.len() % 2 == 1
+                && rest.as_bytes()[mid] == b' '
+                && rest[..mid] == rest[mid + 1..];
             // Fallback name only; `rename to` or the `+++` header refine it.
-            let name = rest
-                .rfind(" b/")
-                .map(|p| &rest[p + 3..])
-                .unwrap_or(rest)
-                .to_string();
+            let name = if same_path_twice {
+                rest[..mid].to_string()
+            } else {
+                rest.rfind(" b/")
+                    .map(|p| &rest[p + 3..])
+                    .unwrap_or(rest)
+                    .to_string()
+            };
             current = Some(FileEntry {
                 name,
+                prefixed: Some(!same_path_twice),
                 ..FileEntry::default()
             });
             continue;
@@ -533,12 +609,8 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
 
         // Rule 4: `--- X` + `+++ Y` header pair.
         if let Some(minus) = line.strip_prefix("--- ") {
-            let next = lines
-                .get(i)
-                .map(|r| r.strip_suffix('\r').unwrap_or(r))
-                .and_then(|n| n.strip_prefix("+++ "));
-            if let Some(plus) = next {
-                let name = header_name(minus, plus);
+            let next = lines.get(i).map(|r| structural(r));
+            if let Some(plus) = next.as_deref().and_then(|n| n.strip_prefix("+++ ")) {
                 // A pair opening a NEW section must be followed by a hunk
                 // header — every real producer emits one. Without this gate
                 // a stray marked pair (a lying budget's leftovers) would be
@@ -547,22 +619,19 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
                 // section (extended headers already seen) needs no gate.
                 let opens_hunk = lines
                     .get(i + 1)
-                    .map(|r| r.strip_suffix('\r').unwrap_or(r))
-                    .is_some_and(|n| n.starts_with("@@"));
-                let renames_in_place =
-                    current.as_ref().is_some_and(|e| e.header_only());
-                if renames_in_place || opens_hunk {
-                    match current.as_mut().filter(|e| e.header_only()) {
-                        Some(e) => e.name = name,
+                    .is_some_and(|r| structural(r).starts_with("@@"));
+                let open = current.as_mut().filter(|e| e.header_only());
+                if open.is_some() || opens_hunk {
+                    match open {
+                        Some(e) => e.name = header_name(minus, plus, e.prefixed),
                         None => {
                             flush(&mut entries, &mut current);
                             current = Some(FileEntry {
-                                name,
+                                name: header_name(minus, plus, None),
                                 ..FileEntry::default()
                             });
                         }
                     }
-                    in_prologue = false;
                     in_mbox_message = false;
                     i += 1; // consume the `+++` line too
                     continue;
@@ -585,7 +654,7 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
                     continue;
                 }
                 Some(_) => continue, // quoted hunk in prose, no file section
-                None if current.is_some() && !in_prologue => return None,
+                None if current.is_some() => return None,
                 None => continue,
             }
         }
@@ -647,15 +716,21 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
         }
 
         // Rule 8: content outside any hunk → stale budget, fall back. Only
-        // the mbox message region is exempt (in_mbox_message implies
-        // in_prologue, so this is the narrower of the two states): the
-        // stream-start prologue gets no tolerance, because a marked line
-        // there is a head-truncated stream's lost content.
-        if (line.starts_with('+') || line.starts_with('-')) && !in_mbox_message {
+        // the mbox message region is exempt, and only up to format-patch's
+        // diffstat: past it nothing but diffstat precedes the file header,
+        // so a marked line there — like one in the stream-start prologue —
+        // is a truncated or hand-edited stream's lost content.
+        if (line.starts_with('+') || line.starts_with('-'))
+            && (!in_mbox_message || past_diffstat)
+        {
             return None;
         }
 
-        // Rule 9: prose.
+        // Rule 9: prose. A diffstat line (` <path> | N +-`) in the mbox
+        // message region ends rule 8's tolerance.
+        if in_mbox_message && line.starts_with(' ') && line.contains(" | ") {
+            past_diffstat = true;
+        }
     }
 
     // Budget owed at EOF.
@@ -686,7 +761,9 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
             )
         };
         out.push(label);
-        // Column 0: anchored greps (`^[+-]`) must match these.
+        // Column 0: anchored greps (`^[+-]`) must match these. (Holds for
+        // uncoloured input; a `--color` stream's body lines are its own
+        // bytes and open with git's colour escape — fidelity outranks it.)
         out.extend(e.changes);
     }
     Some(out.join("\n"))
@@ -999,6 +1076,10 @@ diff --git a/b.rs b/b.rs
         (
             "git_diff_u0",
             include_str!("../../../tests/fixtures/diff/git_diff_u0_raw.txt"),
+        ),
+        (
+            "git_diff_no_prefix",
+            include_str!("../../../tests/fixtures/diff/git_diff_no_prefix_raw.txt"),
         ),
         (
             "git_diff_function_context",
@@ -1416,16 +1497,47 @@ diff --git a/b.rs b/b.rs
         assert!(condense_unified_diff_strict(diff).is_none());
     }
 
-    // --- condense_stdin: the decode → strip-ANSI → parse → guard pipeline ---
+    // --- condense_stdin: the decode → parse → guard pipeline ---
 
     #[test]
-    fn stdin_strips_ansi_before_parsing() {
+    fn stdin_colored_stream_parses_with_content_bytes_intact() {
         // Reproducer 9: `git diff --color` through a pipe used to condense to
-        // a silently empty result.
+        // a silently empty result. Structure is read through the stripped
+        // view, so the stream parses and the label is clean; the body lines
+        // are the user's bytes, escapes included — the parser cannot tell
+        // git's colouring from escapes that are part of the content, and
+        // fidelity outranks tidiness.
         let colored = "\u{1b}[1mdiff --git a/x b/x\u{1b}[m\n\u{1b}[1m--- a/x\u{1b}[m\n\u{1b}[1m+++ b/x\u{1b}[m\n\u{1b}[36m@@ -1 +1 @@\u{1b}[m\n\u{1b}[31m-old_line_content\u{1b}[m\n\u{1b}[32m+new_line_content\u{1b}[m\n";
         let out = condense_stdin(colored.as_bytes()).expect("colored diff must parse");
         assert!(out.contains("[file] x (+1 -1)"), "got:\n{out}");
-        assert!(out.lines().any(|l| l == "-old_line_content"));
+        assert!(out
+            .lines()
+            .any(|l| l == "\u{1b}[31m-old_line_content\u{1b}[m"));
+        // GNU `diff -u --color=always`: a bare header pair whose `@@` is
+        // coloured, so rule 4's opens-a-hunk lookahead must read through
+        // the stripped view too.
+        let gnu = "\u{1b}[1m--- n.txt\t2026-01-01\u{1b}[m\n\u{1b}[1m+++ n.txt\t2026-01-02\u{1b}[m\n\u{1b}[36m@@ -1 +1 @@\u{1b}[m\n\u{1b}[31m-old\u{1b}[m\n\u{1b}[32m+new\u{1b}[m\n";
+        let out = condense_stdin(gnu.as_bytes()).expect("coloured GNU diff must parse");
+        assert!(out.contains("[file] n.txt (+1 -1)"), "got:\n{out}");
+    }
+
+    #[test]
+    fn ansi_inside_content_lines_survives_verbatim() {
+        // Escapes that are the *content* (snapshot fixtures of colouring
+        // tools) were stripped along with git's decoration, so a reviewer
+        // could not see whether the escapes were what changed. The file
+        // path (`rtk diff a b`) was already byte-faithful on the same
+        // content; the stdin path now is too.
+        let diff = "diff --git a/s b/s\n--- a/s\n+++ b/s\n@@ -1 +1 @@\n-\u{1b}[31merror\u{1b}[0m old\n+\u{1b}[31merror\u{1b}[0m new\n";
+        let out = condense_stdin(diff.as_bytes()).expect("must parse");
+        assert!(out.contains("[file] s (+1 -1)"), "got:\n{out}");
+        assert!(out.lines().any(|l| l == "-\u{1b}[31merror\u{1b}[0m old"));
+        assert!(out.lines().any(|l| l == "+\u{1b}[31merror\u{1b}[0m new"));
+        // And a CR that follows the content's own reset sequence still
+        // counts as the line's CR for structural purposes.
+        let crlf = "--- a/s\n+++ b/s\n@@ -1 +1 @@\n-x\u{1b}[0m\r\n+y\u{1b}[0m\r\n";
+        let out = condense_unified_diff(crlf);
+        assert!(out.split('\n').any(|l| l == "-x\u{1b}[0m\r"), "got:\n{out:?}");
     }
 
     #[test]
@@ -1531,6 +1643,94 @@ diff --git a/b.rs b/b.rs
         let diff = "diff --git a/b/x.rs b/b/x.rs\n--- a/b/x.rs\n+++ b/b/x.rs\n@@ -1 +1 @@\n-old\n+new\n";
         let out = condense_unified_diff(diff);
         assert!(out.contains("[file] b/x.rs (+1 -1)"), "got:\n{out}");
+    }
+
+    #[test]
+    fn no_prefix_streams_keep_a_and_b_directories() {
+        // `git diff --no-prefix` (or `diff.noprefix=true`) emits bare paths,
+        // so a leading `a/` or `b/` is a directory, not a prefix to strip.
+        // The `diff --git X Y` line settles it — `--no-prefix` repeats one
+        // path — including for creations and deletions, where the header
+        // pair has a `/dev/null` side and cannot decide on its own. Real
+        // `git diff --cached --no-prefix` capture: a modify and a creation
+        // under `b/`, a deletion under `a/`, and a path with a space (git
+        // appends a tab to those header names).
+        let fixture = include_str!("../../../tests/fixtures/diff/git_diff_no_prefix_raw.txt");
+        let out = condense_unified_diff(fixture);
+        assert_ne!(out, fixture, "--no-prefix stream fell back to raw");
+        for want in [
+            "[file] a/y.rs (deleted) (+0 -1)",
+            "[file] b/has space.txt (+1 -0)",
+            "[file] b/x.rs (+1 -1)",
+            "[file] b/z.rs (new file) (+1 -0)",
+        ] {
+            assert!(out.lines().any(|l| l == want), "missing {want:?} in:\n{out}");
+        }
+        // A prefixed pair with no `diff --git` line still strips once, an
+        // unprefixed pair (`diff -u` of two files in a `b/` directory)
+        // repeats the path and keeps it, and a prefixed path with a space
+        // is still two distinct halves.
+        let bare_prefixed = "--- a/b/x.rs\n+++ b/b/x.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        assert!(condense_unified_diff(bare_prefixed).contains("[file] b/x.rs (+1 -1)"));
+        let bare_plain = "--- b/x.rs\t2026-01-01\n+++ b/x.rs\t2026-01-02\n@@ -1 +1 @@\n-old\n+new\n";
+        assert!(condense_unified_diff(bare_plain).contains("[file] b/x.rs (+1 -1)"));
+        let spaced = "diff --git a/foo bar b/foo bar\n--- a/foo bar\t\n+++ b/foo bar\t\n@@ -1 +1 @@\n-old\n+new\n";
+        assert!(condense_unified_diff(spaced).contains("[file] foo bar (+1 -1)"));
+        // `diff --cc <path>` carries one path; a file named `a a` must not
+        // read as `a` repeated.
+        let cc = "diff --cc a a\n--- a/a a\n+++ b/a a\n@@@ -1,1 -1,1 +1,1 @@@\n- x\n -y\n++z\n";
+        let out = condense_unified_diff(cc);
+        assert!(out.contains("[file] a a (+1 -2)"), "got:\n{out}");
+    }
+
+    #[test]
+    fn backslash_line_away_from_a_hunk_is_prose() {
+        // Rule 1b keeps the new-side `\ No newline` marker only on the line
+        // right after the budget closes. A `\` line anywhere else outside a
+        // hunk used to be appended to the section as if it were the marker,
+        // rendering prose as diff content.
+        let diff = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n\\ No newline at end of file\nsome trailing prose\n\\ this is prose, not a diff marker\n";
+        let out = condense_unified_diff(diff);
+        assert!(out.contains("[file] f (+1 -1)"), "got:\n{out}");
+        assert!(out.lines().any(|l| l == "\\ No newline at end of file"));
+        assert!(
+            !out.contains("this is prose"),
+            "stray backslash line rendered as content:\n{out}"
+        );
+    }
+
+    #[test]
+    fn mbox_marked_lines_past_the_diffstat_fall_back_to_raw() {
+        // A format-patch series with the second patch's `diff --git` /
+        // `---` / `+++` / `@@` block stripped (a hand-edited patch, a mail
+        // client's reflow). The orphaned hunk body sits in the mbox message
+        // region past the diffstat, where the prose exemption used to
+        // swallow it; nothing in the output suggested it was incomplete.
+        let series = "From fe6a6d0d8316535b5ac232f5d7cc6d227b187b9e Mon Sep 17 00:00:00 2001\nSubject: [PATCH 1/2] one\n\n- a bullet in the message\n---\n x.txt | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\ndiff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+b\n-- \n2.54.0\n\nFrom 0e7632a01b00c70cbc9dafcf1f23c71fa6b10de1 Mon Sep 17 00:00:00 2001\nSubject: [PATCH 2/2] two\n\n- another bullet\n---\n y.txt | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)\n\n-p\n+q\n-- \n2.54.0\n";
+        assert!(
+            condense_unified_diff_strict(series).is_none(),
+            "orphaned hunk body in an mbox region was dropped"
+        );
+        // The intact series (with the block restored) still parses, bullets
+        // and separators included, and the signature is not counted.
+        let intact = series.replace(
+            "\n-p\n+q\n",
+            "\ndiff --git a/y.txt b/y.txt\n--- a/y.txt\n+++ b/y.txt\n@@ -1 +1 @@\n-p\n+q\n",
+        );
+        let out = condense_unified_diff_strict(&intact).expect("intact series must parse");
+        assert!(out.contains("[file] y.txt (+1 -1)"), "got:\n{out}");
+        assert!(!out.contains("bullet"), "got:\n{out}");
+        // Version notes between `---` and the diffstat (the kernel / b4
+        // convention) are column-0 bullets past the separator; they must
+        // stay prose, which is why the tolerance ends at the diffstat and
+        // not at `---`.
+        let notes = intact.replace(
+            "---\n y.txt | 2 +-",
+            "---\nChanges in v2:\n- rebased\n- dropped the hack\n\n y.txt | 2 +-",
+        );
+        let out = condense_unified_diff_strict(&notes).expect("version notes must stay prose");
+        assert!(out.contains("[file] y.txt (+1 -1)"), "got:\n{out}");
+        assert!(!out.contains("rebased"), "got:\n{out}");
     }
 
     #[test]
