@@ -355,11 +355,15 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<usize>, usize)> {
 ///    a bare `--` there falls to rule 8. (Bound: in a malformed mbox stream
 ///    a stale-budget leftover of exactly `--` is swallowed as a signature;
 ///    every other leftover value still falls through.)
-/// 8. Any other `+`/`-` marked line outside a hunk and after the prologue is
-///    evidence of a stale or under-declared budget → `None`. (Well-formed
-///    unified diffs have no content outside hunks. The prologue exclusion
-///    means a hunk quoted in patch prose stays prose — including its marked
-///    lines.)
+/// 8. Any other `+`/`-` marked line outside a hunk is evidence of a stale
+///    or under-declared budget → `None`, with one exemption: inside an mbox
+///    message region (rule 2 separator to that patch's first file header),
+///    column-0 marked lines are commit prose — the format-patch `---`
+///    message/diffstat separator, bullet lists, quoted hunks. The
+///    stream-start prologue earns no such exemption: a marked line before
+///    the first file header of a never-mbox stream is a head-truncated
+///    stream's lost content, and must fall back raw rather than be dropped
+///    as prose.
 /// 9. Everything else is prose and is dropped.
 fn condense_unified_diff_strict(diff: &str) -> Option<String> {
     let mut lines: Vec<&str> = diff.split('\n').collect();
@@ -642,8 +646,12 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
             continue;
         }
 
-        // Rule 8: content outside any hunk → stale budget, fall back.
-        if (line.starts_with('+') || line.starts_with('-')) && !in_prologue {
+        // Rule 8: content outside any hunk → stale budget, fall back. Only
+        // the mbox message region is exempt (in_mbox_message implies
+        // in_prologue, so this is the narrower of the two states): the
+        // stream-start prologue gets no tolerance, because a marked line
+        // there is a head-truncated stream's lost content.
+        if (line.starts_with('+') || line.starts_with('-')) && !in_mbox_message {
             return None;
         }
 
@@ -1573,6 +1581,18 @@ diff --git a/b.rs b/b.rs
     }
 
     #[test]
+    fn truncated_prologue_marked_lines_fall_back_to_raw() {
+        // A stream whose beginning was cut mid-hunk (a `head`-clipped
+        // capture, a pipe that lost its first chunk) puts real hunk-body
+        // lines before the first file header. They must force raw
+        // passthrough, not be dropped as prologue prose while the intact
+        // tail condenses into a complete-looking result.
+        let diff = "-lost removal\n+lost addition\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y\n";
+        assert!(condense_unified_diff_strict(diff).is_none());
+        assert_eq!(condense_unified_diff(diff), diff);
+    }
+
+    #[test]
     fn malformed_hunk_header_falls_back_to_raw() {
         let diff = "--- a/f\n+++ b/f\n@@ garbage @@\n-old\n+new\n";
         assert!(condense_unified_diff_strict(diff).is_none());
@@ -1609,9 +1629,10 @@ diff --git a/b.rs b/b.rs
         // design, so its savings come only from dropped metadata. Measured on
         // this corpus (metadata-heavy streams) that is 52-87% per fixture;
         // on content-heavy single-file diffs it can fall to single digits
-        // (~4% on this branch's own self-diff). That clears the 20%
-        // admission bar in CONTRIBUTING.md on realistic streams but is not
-        // guaranteed by construction. What must always hold: the output is never
+        // (~4% on this branch's own self-diff). The 20% admission bar in
+        // CONTRIBUTING.md is asserted per-fixture on the metadata-heavy
+        // streams in the test below; it is not guaranteed by construction
+        // on content-heavy input. What must always hold: the output is never
         // larger than the input (the `never_worse` guard's contract,
         // verified here at the filter level). Percentages above are by this
         // test's whitespace-token metric; the runtime guard uses
@@ -1621,6 +1642,36 @@ diff --git a/b.rs b/b.rs
             assert!(
                 count_tokens(&out) <= count_tokens(fixture),
                 "{name}: output grew"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_heavy_fixtures_clear_the_admission_bar() {
+        // Pins the CONTRIBUTING.md 20% admission bar on the metadata-heavy
+        // corpus fixtures so the percentages cited above can't rot into
+        // fiction. Content-heavy fidelity fixtures (single-file `diff -u`
+        // shapes) are deliberately absent: their savings are input-dependent
+        // and only the never-larger property above binds them.
+        for name in [
+            "git_log_p",
+            "git_diff_multifile",
+            "git_format_patch_single",
+            "git_format_patch_series",
+            "git_format_patch_cover",
+            "git_format_patch_sha256",
+        ] {
+            let fixture = CORPUS
+                .iter()
+                .find(|(n, _)| *n == name)
+                .expect("fixture listed in CORPUS")
+                .1;
+            let out = condense_unified_diff(fixture);
+            let (input, output) = (count_tokens(fixture), count_tokens(&out));
+            // output <= 80% of input  <=>  savings >= 20%.
+            assert!(
+                output * 5 <= input * 4,
+                "{name}: savings below the 20% admission bar ({input} -> {output} tokens)"
             );
         }
     }
