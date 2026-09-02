@@ -50,7 +50,7 @@ enum ManagedAgentState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GlobalExtensionShareStatus {
+enum ExtensionShareStatus {
     NotShared,
     Shared,
     Unknown,
@@ -93,7 +93,7 @@ impl PiCompatibleAgent {
 // removed safely. Hashes are computed after normalizing CRLF to LF and
 // trimming trailing whitespace, matching the comparisons below.
 // The history-based test below verifies that this list remains append-only
-// for every first-parent revision in the current checkout's shipped history.
+// for every revision in the current checkout's ancestor history.
 const KNOWN_PI_PLUGIN_HASHES: &[&str] = &[
     "5e80e811e689adc9d5ae5a59d1d5702060ca0c10320fea7cffd83c659026f1c5",
     "2cbb2a7a9081275d6eda140d9e375f6772b5c354e7fe931c554c371ad8836c6e",
@@ -3655,20 +3655,12 @@ fn ensure_pi_extensions_dir(parent: &Path, name: &str, ctx: InitContext) -> Resu
     Ok(())
 }
 
-/// Check whether the global Pi and OMP extension paths resolve to the same
-/// target.
-fn global_extension_paths_alias(
-    global: bool,
-    path: &Path,
-    agent: PiCompatibleAgent,
-) -> Result<bool> {
-    if !global {
-        return Ok(false);
-    }
-
+/// Check whether the Pi and OMP extension paths for the selected scope resolve
+/// to the same target.
+fn extension_paths_alias(global: bool, path: &Path, agent: PiCompatibleAgent) -> Result<bool> {
     let other_path = match agent {
-        PiCompatibleAgent::Pi => omp_extension_path_for_scope(true)?,
-        PiCompatibleAgent::Omp => pi_plugin_path_for_scope(true)?,
+        PiCompatibleAgent::Pi => omp_extension_path_for_scope(global)?,
+        PiCompatibleAgent::Omp => pi_plugin_path_for_scope(global)?,
     };
 
     Ok(canonicalize_path_for_comparison(path) == canonicalize_path_for_comparison(&other_path))
@@ -3770,7 +3762,7 @@ fn record_managed_agent(
     extension_was_present: bool,
     ctx: InitContext,
 ) -> Result<()> {
-    if !global_extension_paths_alias(global, path, agent)? {
+    if !extension_paths_alias(global, path, agent)? {
         return Ok(());
     }
 
@@ -3782,7 +3774,14 @@ fn record_managed_agent(
         Vec::new()
     } else {
         match read_managed_agents(path)? {
-            ManagedAgentState::Absent => Vec::new(),
+            ManagedAgentState::Absent => {
+                eprintln!(
+                    "[warn] RTK extension ownership state at {} could not be established because this pre-existing extension has no ownership record; preserving the absent state and proceeding without recording {}",
+                    state_path.display(),
+                    agent.state_name()
+                );
+                return Ok(());
+            }
             ManagedAgentState::Known(agents) => agents,
             ManagedAgentState::Unknown => {
                 // Do not turn unknown ownership into a current-agent-only
@@ -3813,17 +3812,7 @@ fn record_managed_agent(
     Ok(())
 }
 
-fn remove_managed_agent_state(
-    global: bool,
-    path: &Path,
-    agent: PiCompatibleAgent,
-    ctx: InitContext,
-) -> Result<()> {
-    if !global_extension_paths_alias(global, path, agent)? {
-        return Ok(());
-    }
-
-    let state_path = shared_agent_state_path(path);
+fn remove_managed_agent_state(state_path: &Path, ctx: InitContext) -> Result<()> {
     if !state_path.exists() {
         return Ok(());
     }
@@ -3835,7 +3824,7 @@ fn remove_managed_agent_state(
         );
     } else {
         // nosemgrep: filesystem-deletion -- state belongs exclusively to the RTK-managed extension.
-        fs::remove_file(&state_path).with_context(|| {
+        fs::remove_file(state_path).with_context(|| {
             format!(
                 "Failed to remove RTK extension ownership state: {}",
                 state_path.display()
@@ -3845,65 +3834,59 @@ fn remove_managed_agent_state(
     Ok(())
 }
 
-/// Determine whether a global Pi-compatible extension path is shared by both
-/// agents, distinguishing definitive sidecar ownership from heuristic or
-/// unavailable ownership information.
+/// Determine whether a Pi-compatible extension path is shared by both agents,
+/// distinguishing definitive sidecar ownership from unavailable information.
 ///
 /// The ownership sidecar records which agents RTK installed for a relocated
-/// shared path. Home-level configuration-directory checks remain as a
-/// fallback for installs performed before the sidecar existed or by another
-/// tool.
-fn global_extension_share_status(
+/// shared path. A missing sidecar is treated as uncertain because the
+/// extension may predate RTK's ownership tracking.
+fn extension_share_status(
     global: bool,
     path: &Path,
     agent: PiCompatibleAgent,
-) -> Result<GlobalExtensionShareStatus> {
-    if !global_extension_paths_alias(global, path, agent)? {
-        return Ok(GlobalExtensionShareStatus::NotShared);
+) -> Result<ExtensionShareStatus> {
+    if !extension_paths_alias(global, path, agent)? {
+        return Ok(ExtensionShareStatus::NotShared);
     }
 
     let other_agent = agent.other();
     match read_managed_agents(path)? {
         ManagedAgentState::Known(agents) => {
             if agents.contains(&other_agent) {
-                Ok(GlobalExtensionShareStatus::Shared)
+                Ok(ExtensionShareStatus::Shared)
             } else {
-                Ok(GlobalExtensionShareStatus::NotShared)
+                Ok(ExtensionShareStatus::NotShared)
             }
         }
-        ManagedAgentState::Unknown => Ok(GlobalExtensionShareStatus::Unknown),
-        ManagedAgentState::Absent => {
-            if global_agent_configuration_is_present(other_agent)? {
-                Ok(GlobalExtensionShareStatus::Unknown)
-            } else {
-                Ok(GlobalExtensionShareStatus::NotShared)
-            }
-        }
+        ManagedAgentState::Absent | ManagedAgentState::Unknown => Ok(ExtensionShareStatus::Unknown),
     }
 }
 
-fn global_agent_configuration_is_present(agent: PiCompatibleAgent) -> Result<bool> {
-    let config_dir = match agent {
-        PiCompatibleAgent::Pi => PI_LOCAL_DIR,
-        PiCompatibleAgent::Omp => OMP_LOCAL_DIR,
-    };
-    Ok(resolve_home_subdir(config_dir)?.is_dir())
+fn extension_scope_name(global: bool) -> &'static str {
+    if global {
+        "global"
+    } else {
+        "project"
+    }
 }
 
-fn warn_if_global_extension_shared_on_install(
+fn warn_if_extension_shared_on_install(
     global: bool,
     path: &Path,
     agent: PiCompatibleAgent,
 ) -> Result<()> {
-    match global_extension_share_status(global, path, agent)? {
-        GlobalExtensionShareStatus::NotShared => {}
-        GlobalExtensionShareStatus::Shared => eprintln!(
-            "[warn] Pi and OMP share the global extension path at {}; installing {} here enables the shared integration for both agents.",
+    let scope = extension_scope_name(global);
+    match extension_share_status(global, path, agent)? {
+        ExtensionShareStatus::NotShared => {}
+        ExtensionShareStatus::Shared => eprintln!(
+            "[warn] Pi and OMP share the {} extension path at {}; installing {} here enables the shared integration for both agents.",
+            scope,
             path.display(),
             agent.name()
         ),
-        GlobalExtensionShareStatus::Unknown => eprintln!(
-            "[warn] Pi and OMP resolve to the same global extension path at {}, but RTK could not confirm both agents' ownership; installing {} without a definitive ownership record.",
+        ExtensionShareStatus::Unknown => eprintln!(
+            "[warn] Pi and OMP resolve to the same {} extension path at {}, but RTK could not confirm both agents' ownership; installing {} without a definitive ownership record.",
+            scope,
             path.display(),
             agent.name()
         ),
@@ -3912,25 +3895,28 @@ fn warn_if_global_extension_shared_on_install(
     Ok(())
 }
 
-fn confirm_shared_global_uninstall(
+fn confirm_shared_extension_uninstall(
     global: bool,
     path: &Path,
     agent: PiCompatibleAgent,
     patch_mode: PatchMode,
     ctx: InitContext,
 ) -> Result<bool> {
-    match global_extension_share_status(global, path, agent)? {
-        GlobalExtensionShareStatus::NotShared => return Ok(true),
-        GlobalExtensionShareStatus::Unknown => {
+    let scope = extension_scope_name(global);
+    match extension_share_status(global, path, agent)? {
+        ExtensionShareStatus::NotShared => return Ok(true),
+        ExtensionShareStatus::Unknown => {
             eprintln!(
-                "[warn] Pi and OMP resolve to the same global extension path at {}, but RTK could not confirm both agents' ownership; proceeding with {} uninstall without shared-path protection.",
+                "[warn] Pi and OMP resolve to the same {} extension path at {}, but RTK could not confirm both agents' ownership; proceeding with {} uninstall without shared-path protection.",
+                scope,
                 path.display(),
                 agent.name()
             );
             return Ok(true);
         }
-        GlobalExtensionShareStatus::Shared => eprintln!(
-            "[warn] Pi and OMP share the global extension path at {}; uninstalling {} also removes the other agent's shared integration.",
+        ExtensionShareStatus::Shared => eprintln!(
+            "[warn] Pi and OMP share the {} extension path at {}; uninstalling {} changes a path used by the other agent's shared integration.",
+            scope,
             path.display(),
             agent.name()
         ),
@@ -3942,11 +3928,6 @@ fn confirm_shared_global_uninstall(
             if ctx.dry_run {
                 println!(
                     "[dry-run] would leave shared Pi/OMP extension unchanged: {}",
-                    path.display()
-                );
-            } else {
-                println!(
-                    "Skipped removal of shared Pi/OMP extension: {}",
                     path.display()
                 );
             }
@@ -4025,6 +4006,7 @@ fn uninstall_pi_with_patch_mode(
         return Ok(());
     }
 
+    let ownership_state_path = shared_agent_state_path(&plugin_path);
     let Some(content) = read_extension_for_uninstall(&plugin_path, "Pi extension", ctx)? else {
         return Ok(());
     };
@@ -4054,7 +4036,7 @@ fn uninstall_pi_with_patch_mode(
         return Ok(());
     }
 
-    if !confirm_shared_global_uninstall(
+    if !confirm_shared_extension_uninstall(
         global,
         &plugin_path,
         PiCompatibleAgent::Pi,
@@ -4076,13 +4058,13 @@ fn uninstall_pi_with_patch_mode(
             "[dry-run] would remove Pi extension: {}",
             plugin_path.display()
         );
-        remove_managed_agent_state(global, &plugin_path, PiCompatibleAgent::Pi, ctx)?;
+        remove_managed_agent_state(&ownership_state_path, ctx)?;
         print_dry_run_footer();
     } else {
         // nosemgrep: filesystem-deletion -- Pi uninstall removes only a known RTK stock extension.
         fs::remove_file(&plugin_path)
             .with_context(|| format!("Failed to remove Pi extension: {}", plugin_path.display()))?;
-        remove_managed_agent_state(global, &plugin_path, PiCompatibleAgent::Pi, ctx)?;
+        remove_managed_agent_state(&ownership_state_path, ctx)?;
         if verbose > 0 {
             eprintln!("Removed Pi extension: {}", plugin_path.display());
         }
@@ -4113,7 +4095,7 @@ pub fn run_pi_mode_with_patch_mode(
     let plugin_path = pi_plugin_path_for_scope(global)?;
     let extension_was_present = plugin_path.exists();
 
-    warn_if_global_extension_shared_on_install(global, &plugin_path, PiCompatibleAgent::Pi)?;
+    warn_if_extension_shared_on_install(global, &plugin_path, PiCompatibleAgent::Pi)?;
 
     if !validate_stock_pi_plugin_path(&plugin_path, "Pi extension", patch_mode, ctx)? {
         if dry_run {
@@ -4279,7 +4261,7 @@ pub fn run_omp_mode_with_patch_mode(
     let path = omp_extension_path_for_scope(global)?;
     let extension_was_present = path.exists();
 
-    warn_if_global_extension_shared_on_install(global, &path, PiCompatibleAgent::Omp)?;
+    warn_if_extension_shared_on_install(global, &path, PiCompatibleAgent::Omp)?;
 
     if !validate_stock_pi_plugin_path(&path, "OMP extension", patch_mode, ctx)? {
         if dry_run {
@@ -4365,13 +4347,19 @@ pub fn uninstall_omp_with_patch_mode(
         return Ok(());
     }
 
+    let ownership_state_path = shared_agent_state_path(&path);
     let Some(content) = read_extension_for_uninstall(&path, "OMP extension", ctx)? else {
         return Ok(());
     };
 
     if is_known_stock_pi_plugin(&content) {
-        if !confirm_shared_global_uninstall(global, &path, PiCompatibleAgent::Omp, patch_mode, ctx)?
-        {
+        if !confirm_shared_extension_uninstall(
+            global,
+            &path,
+            PiCompatibleAgent::Omp,
+            patch_mode,
+            ctx,
+        )? {
             if dry_run {
                 print_dry_run_footer();
                 return Ok(());
@@ -4384,13 +4372,13 @@ pub fn uninstall_omp_with_patch_mode(
 
         if dry_run {
             println!("[dry-run] would remove OMP extension: {}", path.display());
-            remove_managed_agent_state(global, &path, PiCompatibleAgent::Omp, ctx)?;
+            remove_managed_agent_state(&ownership_state_path, ctx)?;
             print_dry_run_footer();
         } else {
             // nosemgrep: filesystem-deletion -- OMP uninstall removes only the RTK-managed extension file.
             fs::remove_file(&path)
                 .with_context(|| format!("Failed to remove OMP extension: {}", path.display()))?;
-            remove_managed_agent_state(global, &path, PiCompatibleAgent::Omp, ctx)?;
+            remove_managed_agent_state(&ownership_state_path, ctx)?;
             if verbose > 0 {
                 eprintln!("Removed OMP extension: {}", path.display());
             }
@@ -8939,7 +8927,6 @@ mod tests {
             .current_dir(manifest_dir)
             .args([
                 "rev-list",
-                "--first-parent",
                 "HEAD",
                 "--full-history",
                 "--",
@@ -9075,19 +9062,19 @@ mod tests {
                 true,
                 &omp_path,
                 PiCompatibleAgent::Pi,
-                true,
+                false,
                 InitContext::default(),
             )
             .unwrap();
             assert_eq!(
-                global_extension_share_status(true, &omp_path, PiCompatibleAgent::Omp).unwrap(),
-                GlobalExtensionShareStatus::Shared
+                extension_share_status(true, &omp_path, PiCompatibleAgent::Omp).unwrap(),
+                ExtensionShareStatus::Shared
             );
 
             fs::create_dir_all(OMP_LOCAL_DIR).unwrap();
             assert!(
-                global_extension_share_status(true, &pi_path, PiCompatibleAgent::Pi).unwrap()
-                    == GlobalExtensionShareStatus::NotShared,
+                extension_share_status(true, &pi_path, PiCompatibleAgent::Pi).unwrap()
+                    == ExtensionShareStatus::NotShared,
                 "a definitive Pi-only sidecar must override an unrelated project-local OMP directory"
             );
 
@@ -9100,8 +9087,8 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                global_extension_share_status(true, &pi_path, PiCompatibleAgent::Pi).unwrap(),
-                GlobalExtensionShareStatus::Shared
+                extension_share_status(true, &pi_path, PiCompatibleAgent::Pi).unwrap(),
+                ExtensionShareStatus::Shared
             );
         });
         std::env::set_current_dir(&cwd).unwrap();
