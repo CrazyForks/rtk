@@ -49,6 +49,13 @@ enum ManagedAgentState {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalExtensionShareStatus {
+    NotShared,
+    Shared,
+    Unknown,
+}
+
 impl PiCompatibleAgent {
     fn name(self) -> &'static str {
         match self {
@@ -86,8 +93,7 @@ impl PiCompatibleAgent {
 // removed safely. Hashes are computed after normalizing CRLF to LF and
 // trimming trailing whitespace, matching the comparisons below.
 // The history-based test below verifies that this list remains append-only
-// for every revision reachable from Git, including intermediate branch
-// revisions that may have been installed during development.
+// for every first-parent revision in the current checkout's shipped history.
 const KNOWN_PI_PLUGIN_HASHES: &[&str] = &[
     "5e80e811e689adc9d5ae5a59d1d5702060ca0c10320fea7cffd83c659026f1c5",
     "2cbb2a7a9081275d6eda140d9e375f6772b5c354e7fe931c554c371ad8836c6e",
@@ -3650,7 +3656,7 @@ fn ensure_pi_extensions_dir(parent: &Path, name: &str, ctx: InitContext) -> Resu
 }
 
 /// Check whether the global Pi and OMP extension paths resolve to the same
-/// target through `PI_CODING_AGENT_DIR`.
+/// target.
 fn global_extension_paths_alias(
     global: bool,
     path: &Path,
@@ -3702,7 +3708,7 @@ fn canonicalize_path_for_comparison(path: &Path) -> PathBuf {
 }
 
 fn shared_agent_state_path(path: &Path) -> PathBuf {
-    path.with_file_name(PI_AGENT_STATE_FILE)
+    canonicalize_path_for_comparison(path).with_file_name(PI_AGENT_STATE_FILE)
 }
 
 fn read_managed_agents(path: &Path) -> Result<ManagedAgentState> {
@@ -3782,6 +3788,11 @@ fn record_managed_agent(
                 // Do not turn unknown ownership into a current-agent-only
                 // record. The extension was installed successfully, but the
                 // existing state must remain intact for the fallback path.
+                eprintln!(
+                    "[warn] RTK extension ownership state at {} could not be updated because ownership is unknown; preserving it and proceeding without recording {}",
+                    state_path.display(),
+                    agent.state_name()
+                );
                 return Ok(());
             }
         }
@@ -3834,23 +3845,39 @@ fn remove_managed_agent_state(
     Ok(())
 }
 
-/// Check whether a global Pi-compatible extension path is shared by both
-/// agents through `PI_CODING_AGENT_DIR`.
+/// Determine whether a global Pi-compatible extension path is shared by both
+/// agents, distinguishing definitive sidecar ownership from heuristic or
+/// unavailable ownership information.
 ///
 /// The ownership sidecar records which agents RTK installed for a relocated
 /// shared path. Home-level configuration-directory checks remain as a
 /// fallback for installs performed before the sidecar existed or by another
 /// tool.
-fn global_extension_is_shared(global: bool, path: &Path, agent: PiCompatibleAgent) -> Result<bool> {
+fn global_extension_share_status(
+    global: bool,
+    path: &Path,
+    agent: PiCompatibleAgent,
+) -> Result<GlobalExtensionShareStatus> {
     if !global_extension_paths_alias(global, path, agent)? {
-        return Ok(false);
+        return Ok(GlobalExtensionShareStatus::NotShared);
     }
 
     let other_agent = agent.other();
     match read_managed_agents(path)? {
-        ManagedAgentState::Known(agents) => Ok(agents.contains(&other_agent)),
-        ManagedAgentState::Absent | ManagedAgentState::Unknown => {
-            global_agent_configuration_is_present(other_agent)
+        ManagedAgentState::Known(agents) => {
+            if agents.contains(&other_agent) {
+                Ok(GlobalExtensionShareStatus::Shared)
+            } else {
+                Ok(GlobalExtensionShareStatus::NotShared)
+            }
+        }
+        ManagedAgentState::Unknown => Ok(GlobalExtensionShareStatus::Unknown),
+        ManagedAgentState::Absent => {
+            if global_agent_configuration_is_present(other_agent)? {
+                Ok(GlobalExtensionShareStatus::Unknown)
+            } else {
+                Ok(GlobalExtensionShareStatus::NotShared)
+            }
         }
     }
 }
@@ -3868,12 +3895,18 @@ fn warn_if_global_extension_shared_on_install(
     path: &Path,
     agent: PiCompatibleAgent,
 ) -> Result<()> {
-    if global_extension_is_shared(global, path, agent)? {
-        eprintln!(
-            "[warn] Pi and OMP share the global extension path at {} via PI_CODING_AGENT_DIR; installing {} here enables the shared integration for both agents.",
+    match global_extension_share_status(global, path, agent)? {
+        GlobalExtensionShareStatus::NotShared => {}
+        GlobalExtensionShareStatus::Shared => eprintln!(
+            "[warn] Pi and OMP share the global extension path at {}; installing {} here enables the shared integration for both agents.",
             path.display(),
             agent.name()
-        );
+        ),
+        GlobalExtensionShareStatus::Unknown => eprintln!(
+            "[warn] Pi and OMP resolve to the same global extension path at {}, but RTK could not confirm both agents' ownership; installing {} without a definitive ownership record.",
+            path.display(),
+            agent.name()
+        ),
     }
 
     Ok(())
@@ -3886,15 +3919,22 @@ fn confirm_shared_global_uninstall(
     patch_mode: PatchMode,
     ctx: InitContext,
 ) -> Result<bool> {
-    if !global_extension_is_shared(global, path, agent)? {
-        return Ok(true);
+    match global_extension_share_status(global, path, agent)? {
+        GlobalExtensionShareStatus::NotShared => return Ok(true),
+        GlobalExtensionShareStatus::Unknown => {
+            eprintln!(
+                "[warn] Pi and OMP resolve to the same global extension path at {}, but RTK could not confirm both agents' ownership; proceeding with {} uninstall without shared-path protection.",
+                path.display(),
+                agent.name()
+            );
+            return Ok(true);
+        }
+        GlobalExtensionShareStatus::Shared => eprintln!(
+            "[warn] Pi and OMP share the global extension path at {}; uninstalling {} also removes the other agent's shared integration.",
+            path.display(),
+            agent.name()
+        ),
     }
-
-    eprintln!(
-        "[warn] Pi and OMP share the global extension path at {} via PI_CODING_AGENT_DIR; uninstalling {} also removes the other agent's shared integration.",
-        path.display(),
-        agent.name()
-    );
 
     match patch_mode {
         PatchMode::Auto => Ok(true),
@@ -4719,7 +4759,10 @@ fn show_omp_config() -> Result<()> {
 
     println!("\nUsage:");
     println!("  rtk init --agent omp                 # Configure ./.omp/extensions/rtk.ts");
-    println!("  rtk init -g --agent omp              # Configure ~/.omp/agent/extensions/rtk.ts");
+    println!(
+        "  rtk init -g --agent omp              # Configure {}",
+        global_extension.display()
+    );
     println!("  rtk init --agent omp --uninstall     # Remove project OMP RTK extension");
     println!("  rtk init -g --agent omp --uninstall  # Remove global OMP RTK extension");
 
@@ -4743,9 +4786,15 @@ fn print_omp_extension_status(label: &str, path: &Path) -> Result<()> {
                 label,
                 path.display()
             );
+        } else if looks_like_rtk_pi_plugin(&content) {
+            println!(
+                "  {}: {} (modified RTK content - rtk init will ask before overwriting; use --auto-patch to replace)",
+                label,
+                path.display()
+            );
         } else {
             println!(
-                "  {}: {} (modified - rtk init will refuse to overwrite; remove it manually)",
+                "  {}: {} (unrelated content - rtk init will ask before overwriting; use --auto-patch to replace)",
                 label,
                 path.display()
             );
@@ -8890,7 +8939,8 @@ mod tests {
             .current_dir(manifest_dir)
             .args([
                 "rev-list",
-                "--all",
+                "--first-parent",
+                "HEAD",
                 "--full-history",
                 "--",
                 "hooks/pi/rtk.ts",
@@ -9029,11 +9079,15 @@ mod tests {
                 InitContext::default(),
             )
             .unwrap();
-            assert!(global_extension_is_shared(true, &omp_path, PiCompatibleAgent::Omp).unwrap());
+            assert_eq!(
+                global_extension_share_status(true, &omp_path, PiCompatibleAgent::Omp).unwrap(),
+                GlobalExtensionShareStatus::Shared
+            );
 
             fs::create_dir_all(OMP_LOCAL_DIR).unwrap();
             assert!(
-                !global_extension_is_shared(true, &pi_path, PiCompatibleAgent::Pi).unwrap(),
+                global_extension_share_status(true, &pi_path, PiCompatibleAgent::Pi).unwrap()
+                    == GlobalExtensionShareStatus::NotShared,
                 "a definitive Pi-only sidecar must override an unrelated project-local OMP directory"
             );
 
@@ -9045,7 +9099,10 @@ mod tests {
                 InitContext::default(),
             )
             .unwrap();
-            assert!(global_extension_is_shared(true, &pi_path, PiCompatibleAgent::Pi).unwrap());
+            assert_eq!(
+                global_extension_share_status(true, &pi_path, PiCompatibleAgent::Pi).unwrap(),
+                GlobalExtensionShareStatus::Shared
+            );
         });
         std::env::set_current_dir(&cwd).unwrap();
     }

@@ -297,7 +297,7 @@ fn relocated_omp_ownership_is_tracked_symmetrically() {
 }
 
 #[test]
-fn relocated_global_legacy_fallback_ignores_project_agent_config() {
+fn relocated_global_legacy_fallback_warns_but_proceeds() {
     let project = tempfile::tempdir().unwrap();
     let agent_dir = project.path().join("pi-agent");
     let extension_dir = agent_dir.join("extensions");
@@ -327,11 +327,13 @@ fn relocated_global_legacy_fallback_ignores_project_agent_config() {
         &["init", "--agent", "pi", "--global", "--uninstall"],
     );
     assert!(
-        !fallback.status.success(),
-        "home-level OMP fallback should protect a legacy shared extension"
+        fallback.status.success(),
+        "home-level OMP fallback should not block a legacy uninstall: {}",
+        stderr(&fallback)
     );
-    assert!(stderr(&fallback).contains("share the global extension path"));
-    assert!(extension.exists());
+    assert!(stderr(&fallback).contains("could not confirm both agents' ownership"));
+    assert!(stderr(&fallback).contains("proceeding with Pi uninstall"));
+    assert!(!extension.exists());
 }
 
 #[test]
@@ -365,8 +367,24 @@ fn unreadable_ownership_sidecar_warns_without_erasing_state() {
     );
     assert!(stderr(&omp_install).contains("ownership state"));
     assert!(stderr(&omp_install).contains("treating ownership as unknown"));
+    assert!(stderr(&omp_install).contains("could not be updated because ownership is unknown"));
     assert_eq!(std::fs::read(&ownership).unwrap(), [0xff, 0xfe, 0xfd]);
     assert!(extension.exists());
+
+    let pi_uninstall = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "pi", "--global", "--uninstall"],
+    );
+    assert!(
+        pi_uninstall.status.success(),
+        "unknown ownership should warn and proceed with explicit uninstall: {}",
+        stderr(&pi_uninstall)
+    );
+    assert!(stderr(&pi_uninstall).contains("could not confirm both agents' ownership"));
+    assert!(stderr(&pi_uninstall).contains("proceeding with Pi uninstall"));
+    assert!(!extension.exists());
+    assert!(!ownership.exists());
 }
 
 #[test]
@@ -483,14 +501,17 @@ fn omp_modified_uninstall_dry_run_is_non_failing_preview() {
 }
 
 #[test]
-fn omp_show_modified_extension_explains_install_refusal() {
+fn omp_show_distinguishes_modified_and_unrelated_content() {
     let project = TempDir::new().unwrap();
     let agent_dir = project.path().join("omp-agent");
     let extension_dir = agent_dir.join("extensions");
     std::fs::create_dir_all(&extension_dir).unwrap();
     std::fs::write(
         extension_dir.join("rtk.ts"),
-        "// user-modified extension\nexport default () => {}\n",
+        format!(
+            "{}\n// user modification\n",
+            include_str!("../hooks/pi/rtk.ts")
+        ),
     )
     .unwrap();
 
@@ -505,7 +526,33 @@ fn omp_show_modified_extension_explains_install_refusal() {
         "OMP show failed: {}",
         stderr(&output)
     );
-    assert!(stdout(&output).contains("rtk init will refuse to overwrite"));
+    assert!(stdout(&output).contains(
+        "modified RTK content - rtk init will ask before overwriting; use --auto-patch to replace"
+    ));
+    assert!(!stdout(&output).contains("will refuse to overwrite"));
+    assert!(stdout(&output).contains(&format!(
+        "# Configure {}",
+        extension_dir.join("rtk.ts").display()
+    )));
+
+    std::fs::write(
+        extension_dir.join("rtk.ts"),
+        "// unrelated user file\nexport default () => {}\n",
+    )
+    .unwrap();
+    let unrelated = run_rtk(
+        project.path(),
+        &agent_dir,
+        &["init", "--agent", "omp", "--global", "--show"],
+    );
+    assert!(
+        unrelated.status.success(),
+        "OMP show failed for unrelated content: {}",
+        stderr(&unrelated)
+    );
+    assert!(stdout(&unrelated).contains(
+        "unrelated content - rtk init will ask before overwriting; use --auto-patch to replace"
+    ));
 }
 
 #[test]
@@ -643,7 +690,7 @@ fn symlinked_global_agent_directories_are_detected_as_shared() {
         "OMP install through a symlinked agent directory failed: {}",
         stderr(&install)
     );
-    assert!(stderr(&install).contains("share the global extension path"));
+    assert!(stderr(&install).contains("resolve to the same global extension path"));
     assert_eq!(std::fs::read_to_string(&ownership).unwrap(), "omp\n");
 
     let uninstall = run_rtk_without_agent_dir(
@@ -656,4 +703,54 @@ fn symlinked_global_agent_directories_are_detected_as_shared() {
     );
     assert!(stderr(&uninstall).contains("share the global extension path"));
     assert!(extension.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_global_extension_files_share_one_ownership_state() {
+    let project = TempDir::new().unwrap();
+    let home = project.path().join("home");
+    let pi_extension = home.join(".pi/agent/extensions/rtk.ts");
+    let omp_extension = home.join(".omp/agent/extensions/rtk.ts");
+    let pi_ownership = pi_extension.with_file_name(".rtk-agents");
+    let omp_ownership = omp_extension.with_file_name(".rtk-agents");
+
+    std::fs::create_dir_all(pi_extension.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(omp_extension.parent().unwrap()).unwrap();
+    std::fs::write(&pi_extension, include_str!("../hooks/pi/rtk.ts")).unwrap();
+    symlink(&pi_extension, &omp_extension).unwrap();
+
+    let omp_install =
+        run_rtk_without_agent_dir(project.path(), &["init", "--agent", "omp", "--global"]);
+    assert!(
+        omp_install.status.success(),
+        "OMP install through a file symlink failed: {}",
+        stderr(&omp_install)
+    );
+    assert!(stderr(&omp_install).contains("resolve to the same global extension path"));
+
+    let pi_install =
+        run_rtk_without_agent_dir(project.path(), &["init", "--agent", "pi", "--global"]);
+    assert!(
+        pi_install.status.success(),
+        "Pi install through a file symlink failed: {}",
+        stderr(&pi_install)
+    );
+    assert_eq!(std::fs::read_to_string(&pi_ownership).unwrap(), "omp\npi\n");
+    assert!(
+        !omp_ownership.exists(),
+        "file-level aliases must not split ownership state"
+    );
+
+    let uninstall = run_rtk_without_agent_dir(
+        project.path(),
+        &["init", "--agent", "pi", "--global", "--uninstall"],
+    );
+    assert!(
+        !uninstall.status.success(),
+        "Pi uninstall should protect the shared file-level symlink"
+    );
+    assert!(stderr(&uninstall).contains("share the global extension path"));
+    assert!(pi_extension.exists());
+    assert!(omp_extension.exists());
 }
