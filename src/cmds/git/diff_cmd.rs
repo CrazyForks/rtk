@@ -118,9 +118,12 @@ pub fn run_stdin(_verbose: u8) -> Result<()> {
 /// Filter a piped stream: parse strictly (the parser reads structure through
 /// an ANSI-stripped view, so a `git diff --color` stream parses instead of
 /// condensing to silence, while content lines keep their bytes) and apply
-/// the never-worse guard. `None` means the caller must emit its exact input
-/// bytes — including for non-UTF-8 input, where filtering would rewrite the
-/// user's content bytes to U+FFFD (byte fidelity outranks savings here).
+/// the never-worse check — inlined rather than via `guard::never_worse`,
+/// which hands back the winning `&str`, where this path needs `None` to
+/// mean byte-exact fallback. `None` means the caller must emit its exact
+/// input bytes — including for non-UTF-8 input, where filtering would
+/// rewrite the user's content bytes to U+FFFD (byte fidelity outranks
+/// savings here).
 fn condense_stdin(bytes: &[u8]) -> Option<String> {
     let input = std::str::from_utf8(bytes).ok()?;
     let condensed = condense_unified_diff_strict(input)?;
@@ -469,9 +472,17 @@ fn is_mbox_from(line: &str) -> bool {
 /// directory) and only in a prefixed stream: `prefixed` comes from the
 /// section's `diff --git` line when it had one, else from the pair itself —
 /// `--no-prefix` repeats one path (`b/x b/x`), a prefixed pair never does.
+/// Strip the `"…"` git wraps around a path under `core.quotepath` (the
+/// default for any non-ASCII byte); the octal escapes inside stay as is.
+fn dequote(s: &str) -> &str {
+    s.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(s)
+}
+
 fn header_name(minus: &str, plus: &str, prefixed: Option<bool>) -> String {
-    let minus = minus.split('\t').next().unwrap_or(minus);
-    let plus = plus.split('\t').next().unwrap_or(plus);
+    let minus = dequote(minus.split('\t').next().unwrap_or(minus));
+    let plus = dequote(plus.split('\t').next().unwrap_or(plus));
     let prefixed = prefixed.unwrap_or(minus != plus);
     let clean = |side: &str, prefix: &str| -> String {
         if prefixed {
@@ -545,12 +556,15 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<usize>, usize)> {
 ///    such as `rename`/`Binary files`/mode lines annotate it). `diff --git
 ///    X Y` with X == Y marks a `--no-prefix` stream, whose header names keep
 ///    their leading `a/`/`b/` (they are directories there, not prefixes).
-/// 4. A `--- X` line immediately followed by `+++ Y` is a file header: it
-///    renames a still-hunkless section in place, or — when the line after
-///    `+++ Y` opens a hunk, as every real producer's does — opens a new
-///    section. A pair with no hunk behind it is not consumed: it falls to
-///    rules 7-9, so stray marked lines are never swallowed as a phantom
-///    header. This is what ends the prose prologue — the prologue is
+/// 4. A `--- X` line immediately followed by `+++ Y` whose next line opens
+///    a hunk — as every real producer's does — is a file header: it names
+///    a still-hunkless section in place (unless git's `rename to`/`copy
+///    to` already named it exactly), or opens a new section. A pair with
+///    no hunk behind it is never consumed, open section or not: it falls
+///    to rules 7-9, so stray marked lines are never swallowed as a phantom
+///    header. Names are dequoted (`core.quotepath` wraps a non-ASCII path
+///    in `"…"`) before the prefix strip. This is what ends the prose
+///    prologue — the prologue is
 ///    positional (everything before the first file header), never keyed on
 ///    line values. (Bound: mbox prose quoting an unindented, well-formed
 ///    header-plus-hunk block still fabricates a phantom entry — noise, not
@@ -561,8 +575,12 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<usize>, usize)> {
 /// 6. File-level facts producers emit outside hunks become note-only
 ///    entries: `Only in <dir>: <file>` and standalone `Binary files X and Y
 ///    differ` (GNU `diff -r`), `* Unmerged path <file>` (`git diff --ours`
-///    et al. during a merge), and `Submodule <name> <a>..<b>` headers.
-///    These arms are suppressed inside an mbox message region (from a
+///    et al. during a merge; folded into the section git emits for the
+///    same path right after it), `Submodule <path> <a>..<b>` headers and
+///    `Submodule <path> contains … content` dirty lines. `Only in` keeps
+///    the producer's root directory — that root IS the fact — while
+///    `Binary files X and Y` is named like a header pair, so it matches
+///    its siblings. These arms are suppressed inside an mbox message region (from a
 ///    `From <sha>` separator to that patch's first file header), where
 ///    column-0 prose is indistinguishable from them by value.
 /// 7. In a stream that carried an mbox `From <sha>` separator, a line of
@@ -597,8 +615,9 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<usize>, usize)> {
 ///    judged, because it does reach its own file header. The two are told
 ///    apart by shape, per [`MARKED_PROSE_RE`]: if any line the region
 ///    exempted is not a prose shape → `None`. (Bounds: a message whose own
-///    prose imitates a diffstat line (` name | 3`) and then carries
-///    column-0 marked lines falls back raw — noise, not loss; and an
+///    prose imitates a diffstat line (` name | 3`) falls back raw, always:
+///    format-patch's own `---` separator is the column-0 marked line that
+///    follows it — noise, not loss; and an
 ///    orphaned body whose every marked line happens to be prose-shaped is
 ///    still dropped, as is a `--no-stat` region that lost one section's
 ///    headers but kept another's; and a bodyless region whose prose wraps
@@ -632,6 +651,10 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
     // because version notes (`Changes in v2:` + bullets) conventionally go
     // between the two, and on the per-file count-and-signs shape rather
     // than the `N files changed` summary because the latter is localized.
+    // Load-bearing beyond the diffstat: it is the parser's only mid-region
+    // check, so it alone catches a stat-ful patch whose FIRST section lost
+    // its headers while a later one survived — that region does reach a
+    // file header, so no region-close check can ever see it.
     let mut past_diffstat = false;
     // Rule 8's two facts about the open message region, which settle the
     // exemption for a region the diffstat never bounded: whether it reached
@@ -641,8 +664,18 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
     let mut region_exempt_nonprose = false;
 
     fn flush(entries: &mut Vec<FileEntry>, current: &mut Option<FileEntry>) {
-        if let Some(e) = current.take() {
+        if let Some(mut e) = current.take() {
             if !e.is_empty() {
+                // During a merge `git diff` emits `* Unmerged path X` AND a
+                // full section for X; fold the fact into the section so a
+                // consumer counting `[file]` lines sees X once.
+                if entries
+                    .last()
+                    .is_some_and(|p| p.name == e.name && p.notes == ["unmerged"])
+                {
+                    entries.pop();
+                    e.notes.insert(0, "unmerged".to_string());
+                }
                 entries.push(e);
             }
         }
@@ -760,16 +793,19 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
                 && rest[..mid] == rest[mid + 1..];
             // Fallback name only; `rename to` or the `+++` header refine it.
             let name = if same_path_twice {
-                rest[..mid].to_string()
+                dequote(&rest[..mid]).to_string()
             } else {
-                rest.rfind(" b/")
-                    .map(|p| &rest[p + 3..])
-                    .unwrap_or(rest)
-                    .to_string()
+                let y = rest
+                    .rfind(" b/")
+                    .or_else(|| rest.rfind(" \"b/"))
+                    .map_or(rest, |p| dequote(&rest[p + 1..]));
+                y.strip_prefix("b/").unwrap_or(y).to_string()
             };
             current = Some(FileEntry {
                 name,
-                prefixed: Some(!same_path_twice),
+                // `diff --cc X` carries one path and cannot decide; its
+                // header pair does (rule 4).
+                prefixed: line.starts_with("diff --git ").then_some(!same_path_twice),
                 ..FileEntry::default()
             });
             continue;
@@ -821,18 +857,22 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
         if let Some(minus) = line.strip_prefix("--- ") {
             let next = lines.get(i).map(|r| structural(r));
             if let Some(plus) = next.as_deref().and_then(|n| n.strip_prefix("+++ ")) {
-                // A pair opening a NEW section must be followed by a hunk
-                // header — every real producer emits one. Without this gate
-                // a stray marked pair (a lying budget's leftovers) would be
-                // consumed as a phantom header and its two lines lost;
-                // gated, it falls through to rule 8 instead. An open git
-                // section (extended headers already seen) needs no gate.
+                // A pair must be followed by a hunk header — every real
+                // producer emits one, git included (`---`/`+++` only ever
+                // precede the first `@@`). Without this gate a stray marked
+                // pair (a lying budget's leftovers) would be consumed as a
+                // phantom header and its two lines lost; gated, it falls
+                // through to rule 8 instead.
                 let opens_hunk = lines
                     .get(i + 1)
                     .is_some_and(|r| structural(r).starts_with("@@"));
-                let open = current.as_mut().filter(|e| e.header_only());
-                if open.is_some() || opens_hunk {
-                    match open {
+                if opens_hunk {
+                    match current.as_mut().filter(|e| e.header_only()) {
+                        // `rename to`/`copy to` is git's exact path; the pair
+                        // under `--no-prefix` would re-derive it wrongly.
+                        Some(e) if e.notes.iter().any(|n| {
+                            n.starts_with("renamed from ") || n.starts_with("copied from ")
+                        }) => {}
                         Some(e) => e.name = header_name(minus, plus, e.prefixed),
                         None => {
                             flush(&mut entries, &mut current);
@@ -873,7 +913,9 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
         // Rule 6: file-level facts outside hunks, suppressed in mbox prose.
         if !in_mbox_message {
             if let Some(rest) = line.strip_prefix("Only in ") {
-                if let Some((dir, file)) = rest.rsplit_once(": ") {
+                // GNU diff's separator is the FIRST `: `, right after the
+                // directory; a filename may carry its own.
+                if let Some((dir, file)) = rest.split_once(": ") {
                     flush(&mut entries, &mut current);
                     entries.push(FileEntry {
                         name: format!("{}/{}", dir, file),
@@ -889,8 +931,21 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
                 .strip_prefix("Binary files ")
                 .and_then(|r| r.strip_suffix(" differ"))
             {
-                let name = pair.rsplit_once(" and ").map(|(_, b)| b).unwrap_or(pair);
-                let name = name.strip_prefix("b/").unwrap_or(name).to_string();
+                // `diff -r` names X and Y as the same path under two roots,
+                // so the ` and ` at the X/Y boundary is the one where the
+                // sides agree past their first component — a filename that
+                // contains ` and ` is then not split. Named like a header
+                // pair, so the `a/`/`b/` strip follows the same decision.
+                fn tail(p: &str) -> &str {
+                    p.split_once('/').map_or(p, |(_, t)| t)
+                }
+                let (x, y) = pair
+                    .match_indices(" and ")
+                    .map(|(p, _)| (&pair[..p], &pair[p + 5..]))
+                    .find(|(x, y)| tail(x) == tail(y))
+                    .or_else(|| pair.rsplit_once(" and "))
+                    .unwrap_or((pair, pair));
+                let name = header_name(x, y, None);
                 flush(&mut entries, &mut current);
                 entries.push(FileEntry {
                     name,
@@ -909,11 +964,29 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
                 continue;
             }
             if let Some(rest) = line.strip_prefix("Submodule ") {
-                if rest.contains("..") {
+                // `Submodule <path> contains [untracked and ]modified content`
+                // (a dirty submodule, no sha range) or `Submodule <path>
+                // <a>..<b> (<how>):` — the LAST token holding `..` is the
+                // range, so a path containing `..` keeps its name. Only the
+                // path belongs in the name slot.
+                let fact = rest
+                    .rsplit_once(" contains ")
+                    .filter(|(_, what)| what.ends_with(" content"))
+                    .map(|(path, what)| (path.to_string(), Some(what)))
+                    .or_else(|| {
+                        let toks: Vec<&str> = rest.split(' ').collect();
+                        toks.iter()
+                            .rposition(|t| t.contains(".."))
+                            .filter(|&p| p > 0)
+                            .map(|p| (toks[..p].join(" "), None))
+                    });
+                if let Some((name, what)) = fact {
                     flush(&mut entries, &mut current);
+                    let mut notes = vec!["submodule".to_string()];
+                    notes.extend(what.map(str::to_string));
                     entries.push(FileEntry {
-                        name: rest.trim_end_matches(':').to_string(),
-                        notes: vec!["submodule".to_string()],
+                        name,
+                        notes,
                         ..FileEntry::default()
                     });
                     continue;
@@ -1365,6 +1438,10 @@ diff --git a/b.rs b/b.rs
             include_str!("../../../tests/fixtures/diff/git_diff_multifile_raw.txt"),
         ),
         (
+            "git_diff_submodule_dirty",
+            include_str!("../../../tests/fixtures/diff/git_diff_submodule_dirty_raw.txt"),
+        ),
+        (
             "git_diff_u0",
             include_str!("../../../tests/fixtures/diff/git_diff_u0_raw.txt"),
         ),
@@ -1707,13 +1784,16 @@ diff --git a/b.rs b/b.rs
         // must fire in a plain stream's prologue.
         let fixture = include_str!("../../../tests/fixtures/diff/git_diff_unmerged_raw.txt");
         let out = condense_unified_diff(fixture);
+        // The fact line is followed by a full section for the same path;
+        // the two fold into one entry so `[file]` counts stay honest.
         assert!(
-            out.contains("[file] cfile.txt (unmerged)"),
-            "unmerged fact vanished:\n{out}"
+            out.contains("[file] cfile.txt (unmerged) (+4 -0)"),
+            "unmerged fact not folded into its section:\n{out}"
         );
-        assert!(
-            out.contains("[file] cfile.txt (+4 -0)"),
-            "conflict-marker section missing:\n{out}"
+        assert_eq!(
+            out.matches("[file] cfile.txt").count(),
+            1,
+            "unmerged path listed twice:\n{out}"
         );
     }
 
@@ -1723,10 +1803,111 @@ diff --git a/b.rs b/b.rs
         // block whose indented body is prose; the header itself is a fact.
         let fixture = include_str!("../../../tests/fixtures/diff/git_diff_submodule_raw.txt");
         let out = condense_unified_diff(fixture);
+        // Only the path goes in the name slot — the shas and `(rewind)`
+        // would leave a consumer unable to recover it.
         assert!(
-            out.contains("[file] sub e139196..b0ac9b1 (rewind) (submodule)"),
-            "submodule fact vanished:\n{out}"
+            out.contains("[file] sub (submodule)"),
+            "submodule fact vanished or mis-sliced:\n{out}"
         );
+    }
+
+    #[test]
+    fn dirty_submodule_fact_survives_beside_a_condensed_sibling() {
+        // `git diff` (also `--submodule=log`) reports a dirty submodule as a
+        // sha-less `Submodule <path> contains modified content` line; with
+        // a condensed sibling in the stream it used to be dropped as prose.
+        let fixture =
+            include_str!("../../../tests/fixtures/diff/git_diff_submodule_dirty_raw.txt");
+        let out = condense_unified_diff_strict(fixture).expect("real git diff must parse");
+        assert!(out.contains("[file] other.txt (+1 -0)"), "got:\n{out}");
+        assert!(
+            out.contains("[file] sub (submodule, modified content)"),
+            "dirty-submodule fact vanished:\n{out}"
+        );
+        for what in ["untracked content", "untracked and modified content"] {
+            let out = condense_unified_diff_strict(
+                &fixture.replace("modified content", what),
+            )
+            .expect("must parse");
+            assert!(out.contains(&format!("(submodule, {what})")), "got:\n{out}");
+        }
+        // A submodule path containing `..` keeps its name: the range is
+        // the LAST token holding `..`.
+        let out = condense_unified_diff_strict(
+            &fixture.replace(
+                "Submodule sub contains modified content",
+                "Submodule a..b e139196..b0ac9b1 (rewind):",
+            ),
+        )
+        .expect("must parse");
+        assert!(out.contains("[file] a..b (submodule)"), "got:\n{out}");
+    }
+
+    #[test]
+    fn no_prefix_rename_keeps_gits_exact_path() {
+        // `git diff -M --no-prefix`: the pair `--- b/src.txt` / `+++ b/dst.txt`
+        // differs, which reads as prefixed and would strip a real `b/`
+        // directory; `rename to` already named the file exactly.
+        let diff = "diff --git b/src.txt b/dst.txt\nsimilarity index 96%\nrename from b/src.txt\nrename to b/dst.txt\nindex e8823e1..10adcaf 100644\n--- b/src.txt\n+++ b/dst.txt\n@@ -28,3 +28,4 @@\n 28\n 29\n 30\n+31\n";
+        let out = condense_unified_diff_strict(diff).expect("must parse");
+        assert!(
+            out.contains("[file] b/dst.txt (renamed from b/src.txt) (+1 -0)"),
+            "got:\n{out}"
+        );
+        // `diff --cc X` carries one path, so it cannot settle the prefix
+        // question; the pair does (`b/x` twice => a real `b/` directory).
+        let cc = "diff --cc b/x\nindex 1,2..3\n--- b/x\n+++ b/x\n@@@ -1,3 -1,3 +1,3 @@@\n  ctx one\n- conflict MAIN\n -conflict LEFT\n++conflict RESOLVED\n  ctx two\n";
+        let out = condense_unified_diff_strict(cc).expect("must parse");
+        assert!(out.contains("[file] b/x (+1 -2)"), "got:\n{out}");
+    }
+
+    #[test]
+    fn quoted_paths_are_dequoted_before_the_prefix_strip() {
+        // `core.quotepath` (git's default) wraps a non-ASCII path in quotes
+        // on every header line; the prefix strip has to see through them.
+        let diff = "diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"\nindex 587be6b..975fbec 100644\n--- \"a/caf\\303\\251.txt\"\n+++ \"b/caf\\303\\251.txt\"\n@@ -1 +1 @@\n-x\n+y\n";
+        let out = condense_unified_diff_strict(diff).expect("must parse");
+        assert!(
+            out.contains("[file] caf\\303\\251.txt (+1 -1)"),
+            "got:\n{out}"
+        );
+        // The `diff --git` fallback name (no `+++` follows a binary section)
+        // dequotes the same way.
+        let bin = "diff --git \"a/caf\\303\\251.bin\" \"b/caf\\303\\251.bin\"\nindex 587be6b..975fbec 100644\nBinary files \"a/caf\\303\\251.bin\" and \"b/caf\\303\\251.bin\" differ\n";
+        let out = condense_unified_diff_strict(bin).expect("must parse");
+        assert!(
+            out.contains("[file] caf\\303\\251.bin (binary)"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn header_pair_without_a_hunk_is_never_consumed() {
+        // A stray marked pair inside an open, hunkless git section is not a
+        // header (git only ever emits `---`/`+++` before the first `@@`): it
+        // is lost content and forces raw, instead of renaming the section
+        // to `leftover added` and dropping both lines.
+        let diff = "diff --git a/x b/x\nold mode 100644\nnew mode 100755\n--- leftover removed\n+++ leftover added\ndiff --git a/o b/o\n--- a/o\n+++ b/o\n@@ -1 +1 @@\n-1\n+2\n";
+        assert!(condense_unified_diff_strict(diff).is_none());
+    }
+
+    #[test]
+    fn fact_names_split_at_the_producer_boundary() {
+        // GNU diff's `Only in <dir>: <file>` separator is the first `: `;
+        // `Binary files X and Y differ` names the same path under two
+        // roots, so a filename containing ` and ` must not be split.
+        let diff = "Only in docs: notes: draft.md\nBinary files a/black and white.png and b/black and white.png differ\nBinary files x.bin and y.bin differ\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-x\n+y\n";
+        let out = condense_unified_diff_strict(diff).expect("plain diff -r stream must parse");
+        assert!(
+            out.contains("[file] docs/notes: draft.md (only in one side)"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("[file] black and white.png (binary)"),
+            "got:\n{out}"
+        );
+        assert!(out.contains("[file] y.bin (binary)"), "got:\n{out}");
+        assert!(out.contains("[file] f.txt (+1 -1)"), "got:\n{out}");
     }
 
     #[test]
