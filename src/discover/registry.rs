@@ -1648,6 +1648,38 @@ mod tests {
         }
 
         #[test]
+        fn test_lone_cr_inside_quotes_rewrites_as_one_command() {
+            // A `\r` inside quotes is part of the argument, not a line break,
+            // so the block is one logical command with a single prefix.
+            assert_eq!(
+                rewrite_command_no_prefixes("git commit -m 'subject\rin body'", &[]),
+                Some("rtk git commit -m 'subject\rin body'".into())
+            );
+        }
+
+        #[test]
+        fn test_lone_cr_line_gets_a_single_prefix() {
+            // A bare `\r` is not a line break: bash keeps `git log` glued to the
+            // preceding word, so the whole first line is one command and takes
+            // one prefix. Only the `\n` starts a new line.
+            assert_eq!(
+                rewrite_command_no_prefixes("git status\rgit log\ngit diff", &[]),
+                Some("rtk git status\rgit log\nrtk git diff".into())
+            );
+        }
+
+        #[test]
+        fn test_quoted_lone_cr_does_not_bail_out_the_block() {
+            // The raw-break parity check counts `\n` and the `\r` of a CRLF pair
+            // only. Counting a quoted lone `\r` too would make the block look
+            // like it hid a line from the lexer and send it through unrewritten.
+            assert_eq!(
+                rewrite_command_no_prefixes("echo 'a\rb'\ngit log -3", &[]),
+                Some("echo 'a\rb'\nrtk git log -3".into())
+            );
+        }
+
+        #[test]
         fn test_unbalanced_swallowed_newline_passes_through() {
             assert_eq!(
                 rewrite_command_no_prefixes("git commit -m \"subject\ngit status", &[]),
