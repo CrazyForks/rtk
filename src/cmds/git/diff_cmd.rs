@@ -580,9 +580,12 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<usize>, usize)> {
 ///    `Submodule <path> contains … content` dirty lines. `Only in` keeps
 ///    the producer's root directory — that root IS the fact — while
 ///    `Binary files X and Y` is named like a header pair, so it matches
-///    its siblings. These arms are suppressed inside an mbox message region (from a
-///    `From <sha>` separator to that patch's first file header), where
-///    column-0 prose is indistinguishable from them by value.
+///    its siblings. The two GNU arms read the English spelling only — GNU
+///    diff translates both lines (git translates none of its own) — and a
+///    translated one is caught by rule 9, never dropped. These arms are
+///    suppressed inside an mbox message region (from a `From <sha>`
+///    separator to that patch's first file header), where column-0 prose
+///    is indistinguishable from them by value.
 /// 7. In a stream that carried an mbox `From <sha>` separator, a line of
 ///    exactly `--`/`-- ` outside a hunk is the format-patch signature
 ///    separator: prose. This is the single value-keyed exclusion, kept
@@ -622,7 +625,14 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<usize>, usize)> {
 ///    still dropped, as is a `--no-stat` region that lost one section's
 ///    headers but kept another's; and a bodyless region whose prose wraps
 ///    a *short* option to column 0 falls back raw — noise, not loss.)
-/// 9. Everything else is prose and is dropped.
+/// 9. Everything else is prose and is dropped — except in a GNU `diff -r`
+///    stream, recognised by the per-file `diff <opts> X Y` echo GNU diff
+///    prints whenever it compares directories (rule 3b). Such a stream
+///    carries no prose, so a column-0 line no arm read there (a translated
+///    `Only in`/`Binary files`, a `File X is a fifo …` note) is a fact the
+///    parser cannot read: `None`, since dropping it would lose a whole
+///    file silently. A line dropped before the echo was seen counts the
+///    same way once it is — `diff -r` may list an `Only in` first.
 ///
 /// Every rule reads the line through [`structural`] (ANSI- and CR-stripped);
 /// content is pushed from the raw line, so a `--color` stream parses while
@@ -656,6 +666,13 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
     // its headers while a later one survived — that region does reach a
     // file header, so no region-close check can ever see it.
     let mut past_diffstat = false;
+    // Rule 9's two facts about a GNU `diff -r` stream: whether its per-file
+    // `diff <opts> X Y` echo has been seen (a stream that carries no prose,
+    // so an unread column-0 line there is a fact in a language the parser
+    // does not speak), and whether a column-0 line was already dropped as
+    // prologue prose before that echo settled the question.
+    let mut gnu_diff_r = false;
+    let mut dropped_prologue = false;
     // Rule 8's two facts about the open message region, which settle the
     // exemption for a region the diffstat never bounded: whether it reached
     // a file header (then its exempted lines are prose by position and are
@@ -853,6 +870,18 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
             }
         }
 
+        // Rule 3b: GNU diff's per-file command echo (`diff -ru X Y`, printed
+        // whenever it compares directories) marks a `diff -r` stream. Such
+        // a stream carries no prose, so a column-0 line rule 9 already
+        // dropped before this echo was a fact it could not read.
+        if !in_mbox_message && line.starts_with("diff ") {
+            if dropped_prologue {
+                return None;
+            }
+            gnu_diff_r = true;
+            continue;
+        }
+
         // Rule 4: `--- X` + `+++ Y` header pair.
         if let Some(minus) = line.strip_prefix("--- ") {
             let next = lines.get(i).map(|r| structural(r));
@@ -972,21 +1001,23 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
                 let fact = rest
                     .rsplit_once(" contains ")
                     .filter(|(_, what)| what.ends_with(" content"))
-                    .map(|(path, what)| (path.to_string(), Some(what)))
+                    .map(|(path, what)| (path.to_string(), format!("submodule, {what}")))
                     .or_else(|| {
                         let toks: Vec<&str> = rest.split(' ').collect();
                         toks.iter()
                             .rposition(|t| t.contains(".."))
                             .filter(|&p| p > 0)
-                            .map(|p| (toks[..p].join(" "), None))
+                            .map(|p| {
+                                // The range is the fact: keep it in the note.
+                                let range = toks[p].trim_end_matches(':');
+                                (toks[..p].join(" "), format!("submodule {range}"))
+                            })
                     });
-                if let Some((name, what)) = fact {
+                if let Some((name, note)) = fact {
                     flush(&mut entries, &mut current);
-                    let mut notes = vec!["submodule".to_string()];
-                    notes.extend(what.map(str::to_string));
                     entries.push(FileEntry {
                         name,
-                        notes,
+                        notes: vec![note],
                         ..FileEntry::default()
                     });
                     continue;
@@ -1017,6 +1048,19 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
         // rule 8's tolerance.
         if in_mbox_message && MBOX_DIFFSTAT_RE.is_match(line) {
             past_diffstat = true;
+        }
+        // In a GNU `diff -r` stream there is no prose: GNU diff translates
+        // `Only in` and `Binary files` (git does not), so a column-0 line no
+        // arm read is a fact in another language, and dropping it would
+        // lose a whole file silently. Before the echo settles the question,
+        // remember that a drop happened.
+        if !in_mbox_message && !line.is_empty() {
+            if gnu_diff_r {
+                return None;
+            }
+            if entries.is_empty() && current.is_none() {
+                dropped_prologue = true;
+            }
         }
     }
 
@@ -1804,11 +1848,48 @@ diff --git a/b.rs b/b.rs
         let fixture = include_str!("../../../tests/fixtures/diff/git_diff_submodule_raw.txt");
         let out = condense_unified_diff(fixture);
         // Only the path goes in the name slot — the shas and `(rewind)`
-        // would leave a consumer unable to recover it.
+        // would leave a consumer unable to recover it; the range is the
+        // fact, so it rides in the note.
         assert!(
-            out.contains("[file] sub (submodule)"),
+            out.contains("[file] sub (submodule e139196..b0ac9b1)"),
             "submodule fact vanished or mis-sliced:\n{out}"
         );
+    }
+
+    #[test]
+    fn translated_gnu_fact_lines_force_raw_instead_of_vanishing() {
+        // GNU diff translates `Only in` and `Binary files` (git's own
+        // `Binary files` line is never translated). Real capture:
+        // `LC_ALL=fr_FR.UTF-8 diff -ru g1 g2`, diffutils 3.10. Dropping the
+        // translated lines as prose lost three of five files while the
+        // stream still returned `Some`.
+        let french = include_str!("../../../tests/fixtures/diff/diff_ru_fr_raw.txt");
+        assert!(
+            condense_unified_diff_strict(french).is_none(),
+            "translated fact lines were dropped silently"
+        );
+        let body = "diff -ru g1/f.txt g2/f.txt\n--- g1/f.txt\t2026-09-02 20:00:00.000000000 +0200\n+++ g2/f.txt\t2026-09-02 20:00:00.000000000 +0200\n@@ -1,2 +1,2 @@\n a\n-b\n+c\n";
+        // A translated fact BEFORE the first `diff` echo counts once the
+        // echo settles that this is a `diff -r` stream.
+        let leading = format!("Seulement dans g1: onlyleft.txt\n{body}");
+        assert!(condense_unified_diff_strict(&leading).is_none());
+        // The English spelling of the same stream still parses in full.
+        let english = format!(
+            "Binary files g1/bin.dat and g2/bin.dat differ\n{body}Only in g1: onlyleft.txt\nOnly in g2: onlyright.txt\n"
+        );
+        let out = condense_unified_diff_strict(&english).expect("English diff -ru must parse");
+        for label in [
+            "[file] g2/bin.dat (binary)",
+            "[file] g2/f.txt (+1 -1)",
+            "[file] g1/onlyleft.txt (only in one side)",
+            "[file] g2/onlyright.txt (only in one side)",
+        ] {
+            assert!(out.contains(label), "missing {label}:\n{out}");
+        }
+        // The echo is a context marker, not prose: a `git log -p` stream
+        // whose prologue was dropped is unaffected because it has none.
+        let log = "commit 0123456789abcdef0123456789abcdef01234567\nAuthor: A <a@b>\n\n    subject\n\ndiff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n+y\n";
+        assert!(condense_unified_diff_strict(log).is_some());
     }
 
     #[test]
@@ -1840,7 +1921,10 @@ diff --git a/b.rs b/b.rs
             ),
         )
         .expect("must parse");
-        assert!(out.contains("[file] a..b (submodule)"), "got:\n{out}");
+        assert!(
+            out.contains("[file] a..b (submodule e139196..b0ac9b1)"),
+            "got:\n{out}"
+        );
     }
 
     #[test]
