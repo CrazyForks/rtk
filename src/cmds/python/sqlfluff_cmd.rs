@@ -45,6 +45,12 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     });
     let use_json_filter = !user_set_format || user_json_format;
 
+    // Known limitation: joined short-flag forms such as `-fhuman` are not
+    // recognized above, so rtk would still append `--format json`; sqlfluff's
+    // last-value-wins then runs in the user's format while rtk still tries to
+    // JSON-parse it and reports a parse failure. Proper flag-value parsing
+    // belongs to the arg-tokenizer migration (#3681) - fix it there.
+
     let mut cmd = resolved_command("sqlfluff");
 
     if is_lint {
@@ -101,11 +107,11 @@ pub fn filter_sqlfluff_lint_json(output: &str) -> String {
     let parsed: Vec<SqlfluffFile> = match serde_json::from_str(output) {
         Ok(f) => f,
         Err(e) => {
-            return format!(
-                "SQLFluff lint (JSON parse failed: {})\n{}",
-                e,
-                truncate(output, config::limits().passthrough_max_chars)
-            );
+            // Non-negotiable fallback rule (rust-patterns.md): if the filter
+            // fails, pass the raw command output through unchanged and warn
+            // on stderr - never block the user with a mangled summary.
+            eprintln!("rtk: filter warning: sqlfluff JSON filter failed to parse output: {e}");
+            return output.to_string();
         }
     };
 
@@ -119,7 +125,9 @@ pub fn filter_sqlfluff_lint_json(output: &str) -> String {
     if total_violations == 0 {
         return "✓ SQLFluff: No violations found".to_string();
     }
-    files.sort_by_key(|f| std::cmp::Reverse(f.violations.len()));
+    // Worst file first; ties break alphabetically by path so identical input
+    // always yields an identical report regardless of HashMap iteration order.
+    files.sort_by_key(|f| (std::cmp::Reverse(f.violations.len()), f.filepath.as_str()));
 
     let total_files = files.len();
     let fixable_count: usize = files
@@ -128,10 +136,11 @@ pub fn filter_sqlfluff_lint_json(output: &str) -> String {
         .filter(|v| !v.fixes.is_empty())
         .count();
 
-    // Group by rule, keeping the first place each rule fired so the summary is
-    // actionable without re-running raw sqlfluff.
+    // Group by rule over the raw sqlfluff JSON order (`parsed`, pre-sort), so
+    // "first at" is the earliest occurrence in the original output - not the
+    // first after the worst-first file sort above.
     let mut by_rule: HashMap<&str, (usize, &str, Option<u64>)> = HashMap::new();
-    for file in &files {
+    for file in &parsed {
         for v in &file.violations {
             let entry = by_rule
                 .entry(v.code.as_str())
@@ -147,7 +156,9 @@ pub fn filter_sqlfluff_lint_json(output: &str) -> String {
         .iter()
         .map(|(code, (count, path, line))| (*code, *count, *path, *line))
         .collect();
-    rule_counts.sort_by_key(|r| std::cmp::Reverse(r.1));
+    // Most frequent rule first; ties break alphabetically by rule code so
+    // identical input always yields an identical report.
+    rule_counts.sort_by_key(|r| (std::cmp::Reverse(r.1), r.0));
 
     // Build compact output
     let mut result = String::new();
@@ -196,7 +207,9 @@ pub fn filter_sqlfluff_lint_json(output: &str) -> String {
             .iter()
             .map(|(code, (count, line))| (*code, *count, *line))
             .collect();
-        file_rule_counts.sort_by_key(|r| std::cmp::Reverse(r.1));
+        // Most frequent rule first; ties break alphabetically by rule code
+        // for deterministic output.
+        file_rule_counts.sort_by_key(|r| (std::cmp::Reverse(r.1), r.0));
 
         for (rule, count, line) in file_rule_counts.iter().take(MAX_RULES_PER_FILE) {
             match (*count, *line) {
@@ -414,11 +427,112 @@ mod tests {
     // ── error handling ───────────────────────────────────────────────────────
 
     #[test]
-    fn test_filter_json_parse_error() {
-        let result = filter_sqlfluff_lint_json("not valid json");
+    fn test_filter_json_parse_error_passes_raw_through() {
+        let input = "sqlfluff diagnostics: raw line\nanother raw line";
+        let result = filter_sqlfluff_lint_json(input);
+        assert_eq!(
+            result, input,
+            "raw output must pass through unchanged on parse failure"
+        );
         assert!(
-            result.contains("JSON parse failed"),
-            "should report parse failure"
+            !result.contains("JSON parse failed"),
+            "no mangled hybrid summary on stdout"
+        );
+    }
+
+    #[test]
+    fn test_filter_json_parse_error_passes_large_raw_through_uncapped() {
+        // Even a large non-JSON payload must pass through verbatim - the
+        // fallback contract says raw output unchanged, never truncated.
+        let input =
+            std::iter::repeat_n("line of human sqlfluff output\n", 2000).collect::<String>();
+        let result = filter_sqlfluff_lint_json(&input);
+        assert_eq!(result, input, "large raw output must pass through unchanged");
+    }
+
+    #[test]
+    fn test_filter_first_location_uses_original_output_order() {
+        // The heaviest file (2 violations) sorts first in "Top files", but it
+        // appears last in the raw sqlfluff JSON; "first at" must point at the
+        // earliest occurrence in the original output order, not the first file
+        // in the sorted report.
+        let input = r#"[
+  {
+    "filepath": "models/staging/stg_customers.sql",
+    "violations": [
+      {"code": "LT01", "start_line_no": 1, "fixes": []}
+    ]
+  },
+  {
+    "filepath": "models/strict/fct_orders.sql",
+    "violations": [
+      {"code": "LT01", "start_line_no": 500, "fixes": []},
+      {"code": "LT01", "start_line_no": 501, "fixes": []}
+    ]
+  }
+]"#;
+        let result = filter_sqlfluff_lint_json(input);
+        assert!(
+            result.contains("LT01 (3x, first at models/staging/stg_customers.sql:1)"),
+            "first location must come from original output order, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_filter_tied_rules_sort_alphabetically() {
+        // Two rules with equal counts must break ties alphabetically, so the
+        // report is reproducible for identical input.
+        let input = r#"[
+  {
+    "filepath": "models/staging/stg_customers.sql",
+    "violations": [
+      {"code": "LT10", "start_line_no": 1, "fixes": []},
+      {"code": "LT02", "start_line_no": 2, "fixes": []}
+    ]
+  }
+]"#;
+        let result = filter_sqlfluff_lint_json(input);
+        let lt02 = result
+            .find("LT02")
+            .expect("LT02 should be listed");
+        let lt10 = result
+            .find("LT10")
+            .expect("LT10 should be listed");
+        assert!(
+            lt02 < lt10,
+            "tied rules must sort alphabetically, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_filter_tied_files_sort_alphabetically() {
+        // Equal-violation files must break ties by path so "Top files" is
+        // stable across runs on identical input.
+        let input = r#"[
+  {
+    "filepath": "models/staging/stg_orders.sql",
+    "violations": [{"code": "LT01", "start_line_no": 1, "fixes": []}]
+  },
+  {
+    "filepath": "models/staging/stg_customers.sql",
+    "violations": [{"code": "LT01", "start_line_no": 1, "fixes": []}]
+  }
+]"#;
+        let result = filter_sqlfluff_lint_json(input);
+        let files_sec = result
+            .find("Top files:")
+            .expect("report should have a Top files section");
+        let customers = files_sec
+            + result[files_sec..]
+                .find("stg_customers.sql")
+                .expect("customers file should be listed");
+        let orders = files_sec
+            + result[files_sec..]
+                .find("stg_orders.sql")
+                .expect("orders file should be listed");
+        assert!(
+            customers < orders,
+            "tied files must sort alphabetically, got: {result}"
         );
     }
 
