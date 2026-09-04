@@ -52,12 +52,12 @@ The classification logic is shared between discover and rewrite — same pattern
 
 ## Env Prefix Handling
 
-The `ENV_PREFIX` regex strips env variable assignments, `sudo`, and `env` from the front of commands. It handles:
+The `ENV_PREFIX` regex strips env variable assignments and `env` from the front of commands. `sudo` is deliberately not stripped, so sudo-prefixed commands stay unclassified and pass through unrewritten. It handles:
 - Unquoted: `FOO=bar`
 - Double-quoted with spaces: `FOO="bar baz"`
 - Single-quoted: `FOO='bar baz'`
 - Escaped quotes: `FOO="he said \"hello\""`
-- Chained: `A="x y" B=1 sudo git status`
+- Chained: `A="x y" B=1 env git status`
 
 The prefix is stripped twice: once in `classify_command()` to match the underlying command against rules, and again in `rewrite_segment()` to extract it for re-prepending to the rewritten command.
 

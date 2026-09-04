@@ -1404,9 +1404,9 @@ fn rewrite_segment_inner(
     if context == RewriteContext::Normal
         && (cmd_part.starts_with("head -") || cmd_part.starts_with("tail "))
     {
-        // head/tail rewrite to `rtk read`, so honour exclude_commands here too —
-        // this branch returns before the checks below and used to ignore the list.
-        // Any sudo/env prefix has already been peeled by strip_disabled_prefix above.
+        // head/tail rewrite to `rtk read`, so honour exclude_commands here too:
+        // this branch returns before the checks below. Any env prefix has already
+        // been peeled by strip_disabled_prefix above.
         if is_excluded(cmd_part, excluded) {
             return None;
         }
@@ -3049,12 +3049,8 @@ mod tests {
             rewrite_command_no_prefixes("tail -20 src/main.rs", &excluded),
             None
         );
-        // A sudo/env prefix is peeled by strip_disabled_prefix before this branch,
+        // An env prefix is peeled by strip_disabled_prefix before this branch,
         // so the exclusion still applies to the wrapped head/tail.
-        assert_eq!(
-            rewrite_command_no_prefixes("sudo head -20 src/main.rs", &excluded),
-            None
-        );
         assert_eq!(
             rewrite_command_no_prefixes("RUST_LOG=debug tail -20 src/main.rs", &excluded),
             None
