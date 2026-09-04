@@ -8906,7 +8906,7 @@ mod tests {
         );
         assert!(is_known_stock_pi_plugin(PI_PLUGIN));
 
-        let crlf = PI_PLUGIN.replace('\n', "\r\n");
+        let crlf = PI_PLUGIN.replace("\r\n", "\n").replace('\n', "\r\n");
         assert!(is_current_pi_plugin(&crlf));
         assert!(is_known_stock_pi_plugin(&crlf));
 
