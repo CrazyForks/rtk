@@ -567,11 +567,16 @@ fn parse_hunk_header(line: &str) -> Option<(Vec<usize>, usize)> {
 ///    budget still owed → `None`. (Hunks close the moment the budget hits
 ///    zero, so a `@@` or file header arriving while a hunk is open is itself
 ///    budget-owed → the invalid-prefix arm returns `None`.) The
-///    `\ No newline at end of file` marker consumes no budget but is kept as
-///    content — in-hunk (old side) or on the line right after the budget
-///    closes (new side) — because it is the only witness of a newline-only
-///    change. A `\` line anywhere else is prose.
-/// 2. An mbox `From <sha>` separator resets to the prose prologue.
+///    `\ No newline at end of file` marker consumes no budget. It describes
+///    the line directly above it, so it is kept as content exactly when
+///    that line was emitted — in-hunk after a `-`/`+` line, or on the line
+///    right after the budget closed on one — because it is the only
+///    witness of a newline-only change. After a context line, which the
+///    output never carries, it is dropped: kept, it would sit under the
+///    last marked line and describe the wrong one. A `\` line anywhere
+///    else is prose.
+/// 2. An mbox `From <sha>` separator, or an `hg export` changeset header
+///    (`# HG changeset patch`), resets to the prose prologue.
 /// 3. `diff --git` / `diff --cc` opens a file section (git extended headers
 ///    such as `rename`/`Binary files`/mode lines annotate it). `diff --git
 ///    X Y` with X == Y marks a `--no-prefix` stream, whose header names keep
@@ -667,8 +672,9 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
     let mut current: Option<FileEntry> = None;
     let mut hunk: Option<HunkBudget> = None;
     // Index of the line right after the last hunk's budget closed: the only
-    // place a new-side `\ No newline` marker can legitimately sit (rule 1b).
-    let mut closed_at: Option<usize> = None;
+    // place a `\ No newline` marker can legitimately sit (rules 1 and 1b):
+    // one-past the index of the last line pushed as content.
+    let mut emitted_at: Option<usize> = None;
     // Signature tolerance (rule 7) is earned by an mbox separator.
     let mut seen_mbox_from = false;
     // True from a `From <sha>` separator to that patch's first file header:
@@ -730,11 +736,17 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
         // Rule 1: the open hunk's budget owns the line.
         if let Some(h) = hunk.as_mut() {
             if line.starts_with('\\') {
-                // "\ No newline at end of file": consumes no budget, but the
-                // fact must survive — without it a trailing-newline-only
-                // change renders as two byte-identical -/+ lines.
-                if let Some(e) = current.as_mut() {
-                    e.changes.push(raw.to_string());
+                // "\ No newline at end of file": consumes no budget. It
+                // describes the line right above it, so it is kept only
+                // when that line was itself emitted — then a trailing-
+                // newline-only change keeps its witness. After a context
+                // line (which is never rendered) it would land under the
+                // last `-`/`+` line and describe the wrong one: dropped.
+                if emitted_at == Some(i - 1) {
+                    if let Some(e) = current.as_mut() {
+                        e.changes.push(raw.to_string());
+                    }
+                    emitted_at = Some(i);
                 }
                 continue;
             }
@@ -768,33 +780,37 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
             if prefix.contains(&b'-') {
                 entry.removed += 1;
                 entry.changes.push(raw.to_string());
+                emitted_at = Some(i);
             } else if prefix.contains(&b'+') {
                 entry.added += 1;
                 entry.changes.push(raw.to_string());
+                emitted_at = Some(i);
             }
             if h.exhausted() {
                 hunk = None;
-                closed_at = Some(i);
             }
             continue;
         }
 
         // Rule 1b: the new-side no-newline marker lands on the line right
-        // after its hunk's budget closed; it still belongs to that hunk's
-        // section. Anywhere else a `\` line is prose (rule 9): the marker's
+        // after its hunk's budget closed; it belongs to that hunk's section
+        // and is kept when the closing line was emitted (rule 1's placement
+        // test). Anywhere else a `\` line is prose (rule 9): the marker's
         // text is localized by GNU diff, so position, not value, decides.
         if line.starts_with('\\') {
-            if closed_at == Some(i - 1) {
+            if emitted_at == Some(i - 1) {
                 if let Some(e) = current.as_mut() {
                     e.changes.push(raw.to_string());
                 }
-                closed_at = Some(i);
+                emitted_at = Some(i);
             }
             continue;
         }
 
-        // Rule 2: mbox patch separator → back to the prose prologue.
-        if is_mbox_from(line) {
+        // Rule 2: mbox patch separator → back to the prose prologue. An
+        // `hg export` changeset header opens the same kind of message
+        // region: `# …` headers and the message precede its `diff -r` echo.
+        if is_mbox_from(line) || line == "# HG changeset patch" {
             // Rule 8's shape check: the region this separator closes is judged.
             if region_exempt_nonprose && !region_reached_body {
                 return None;
@@ -853,21 +869,21 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
                 continue;
             }
             if let Some(from) = line.strip_prefix("rename from ") {
-                e.rename_from = Some(from.to_string());
+                e.rename_from = Some(dequote(from).to_string());
                 continue;
             }
             if let Some(to) = line.strip_prefix("rename to ") {
-                e.name = to.to_string();
+                e.name = dequote(to).to_string();
                 let from = e.rename_from.take().unwrap_or_default();
                 e.notes.push(format!("renamed from {}", from));
                 continue;
             }
             if let Some(from) = line.strip_prefix("copy from ") {
-                e.rename_from = Some(from.to_string());
+                e.rename_from = Some(dequote(from).to_string());
                 continue;
             }
             if let Some(to) = line.strip_prefix("copy to ") {
-                e.name = to.to_string();
+                e.name = dequote(to).to_string();
                 let from = e.rename_from.take().unwrap_or_default();
                 e.notes.push(format!("copied from {}", from));
                 continue;
@@ -1028,8 +1044,13 @@ fn condense_unified_diff_strict(diff: &str) -> Option<String> {
                             .rposition(|t| t.contains(".."))
                             .filter(|&p| p > 0)
                             .map(|p| {
-                                // The range is the fact: keep it in the note.
-                                let range = toks[p].trim_end_matches(':');
+                                // The range and its direction qualifier —
+                                // `(rewind)`, `(new submodule)` — are the
+                                // fact: keep them in the note.
+                                let range = toks[p..]
+                                    .join(" ")
+                                    .trim_end_matches(':')
+                                    .replace(['(', ')'], "");
                                 (toks[..p].join(" "), format!("submodule {range}"))
                             })
                     });
@@ -1564,6 +1585,14 @@ diff --git a/b.rs b/b.rs
             include_str!("../../../tests/fixtures/diff/git_diff_submodule_dirty_raw.txt"),
         ),
         (
+            "git_diff_no_newline",
+            include_str!("../../../tests/fixtures/diff/git_diff_no_newline_raw.txt"),
+        ),
+        (
+            "hg_export",
+            include_str!("../../../tests/fixtures/diff/hg_export_raw.txt"),
+        ),
+        (
             "git_diff_u0",
             include_str!("../../../tests/fixtures/diff/git_diff_u0_raw.txt"),
         ),
@@ -1666,10 +1695,15 @@ diff --git a/b.rs b/b.rs
     /// Property (a): every `+`/`-` hunk-body line in the input survives to
     /// the output verbatim, at column 0.
     ///
-    /// Body lines are extracted here by replaying only the hunk budgets — an
-    /// independent (and deliberately dumber) walk than the parser under test:
-    /// it knows nothing about prose, headers, or file sections beyond "a
-    /// budget opened at `@@`".
+    /// Body lines are extracted here by replaying only the hunk budgets — a
+    /// deliberately dumber walk than the parser under test: it knows nothing
+    /// about prose, headers, or file sections beyond "a budget opened at
+    /// `@@`". The per-parent presence rule is the same one the parser uses
+    /// (there is no second formula for git's combined-diff columns), so the
+    /// oracle that keeps this walk honest is the header itself: git's counts
+    /// must be consumed exactly — over-consumption underflows and panics,
+    /// and under-consumption (a budget still owed when the next `@@`, file
+    /// header or EOF arrives) is asserted below.
     #[test]
     fn corpus_every_marked_body_line_survives() {
         for (name, fixture) in CORPUS {
@@ -1691,8 +1725,9 @@ diff --git a/b.rs b/b.rs
                     let parents = old.len();
                     let prefix: Vec<char> = line.chars().take(parents).collect();
                     assert!(
-                        prefix.len() == parents,
-                        "replay hit a short hunk line — corpus fixture malformed"
+                        prefix.len() == parents
+                            && prefix.iter().all(|c| matches!(c, ' ' | '-' | '+')),
+                        "{name}: budget still owed ({old:?} / {new}) at a non-body line {line:?} — the presence rule under-consumed"
                     );
                     let in_result = !prefix.contains(&'-');
                     for (k, left) in old.iter_mut().enumerate() {
@@ -1719,6 +1754,10 @@ diff --git a/b.rs b/b.rs
                     }
                 }
             }
+            assert!(
+                budget.is_none(),
+                "{name}: budget still owed at EOF — the presence rule under-consumed"
+            );
             assert!(
                 !expected.is_empty(),
                 "{name}: replay found no body lines — fixture or replay broken"
@@ -1929,7 +1968,7 @@ diff --git a/b.rs b/b.rs
         // would leave a consumer unable to recover it; the range is the
         // fact, so it rides in the note.
         assert!(
-            out.contains("[file] sub (submodule e139196..b0ac9b1)"),
+            out.contains("[file] sub (submodule e139196..b0ac9b1 rewind)"),
             "submodule fact vanished or mis-sliced:\n{out}"
         );
     }
@@ -2000,7 +2039,7 @@ diff --git a/b.rs b/b.rs
         )
         .expect("must parse");
         assert!(
-            out.contains("[file] a..b (submodule e139196..b0ac9b1)"),
+            out.contains("[file] a..b (submodule e139196..b0ac9b1 rewind)"),
             "got:\n{out}"
         );
     }
@@ -2039,6 +2078,14 @@ diff --git a/b.rs b/b.rs
         let out = condense_unified_diff_strict(bin).expect("must parse");
         assert!(
             out.contains("[file] caf\\303\\251.bin (binary)"),
+            "got:\n{out}"
+        );
+        // `rename to` / `copy to` name the entry directly and are quoted the
+        // same way; otherwise one file gets two spellings across a stream.
+        let ren = "diff --git \"a/caf\\303\\251.txt\" \"b/na\\303\\257ve.txt\"\nsimilarity index 100%\nrename from \"caf\\303\\251.txt\"\nrename to \"na\\303\\257ve.txt\"\n";
+        let out = condense_unified_diff_strict(ren).expect("must parse");
+        assert!(
+            out.contains("[file] na\\303\\257ve.txt (renamed from caf\\303\\251.txt)"),
             "got:\n{out}"
         );
     }
@@ -2238,6 +2285,58 @@ diff --git a/b.rs b/b.rs
             "no-newline marker lost:\n{out}"
         );
         assert!(out.contains("[file] eol.txt (+1 -1)"), "got:\n{out}");
+    }
+
+    #[test]
+    fn hg_export_condenses_despite_its_prologue_and_diff_echo() {
+        // Real `hg export tip` (Mercurial 7.0.1): `# …` headers and the
+        // message at column 0, then a `diff -r <a> -r <b> <file>` echo before
+        // each header pair. The prose used to latch `dropped_prologue`, and
+        // the echo then turned it into a whole-stream raw fallback: 0%
+        // savings for a whole producer. The changeset header now opens a
+        // message region, like an mbox `From`.
+        let fixture = include_str!("../../../tests/fixtures/diff/hg_export_raw.txt");
+        let out = condense_unified_diff_strict(fixture).expect("hg export must parse");
+        assert!(out.contains("[file] f.txt (+1 -1)"), "got:\n{out}");
+        assert!(out.contains("[file] g.txt (+1 -0)"), "got:\n{out}");
+        assert!(!out.contains("bullet"), "message prose leaked:\n{out}");
+        // The message region ends at the first file header; the second
+        // echo arrives outside it and still marks the `diff -r` context, so
+        // an unread column-0 line after it forces raw as in any GNU stream.
+        let with_fact = format!("{fixture}Seulement dans b: h.txt\n");
+        assert!(condense_unified_diff_strict(&with_fact).is_none());
+    }
+
+    #[test]
+    fn no_newline_marker_stays_attached_to_the_line_it_describes() {
+        // Real `git diff` of two files: `f.txt` changes its first line while
+        // its unchanged last line lacks a newline (marker after a context
+        // line), and `g.txt` gains a trailing newline (marker after `-y`).
+        // The first marker used to land under `+A` and claim the ADDED line
+        // had no newline; it must be dropped. The second is the witness of
+        // a newline-only change and must stay right under `-y`.
+        let fixture = include_str!("../../../tests/fixtures/diff/git_diff_no_newline_raw.txt");
+        let out = condense_unified_diff_strict(fixture).expect("must parse");
+        let lines: Vec<&str> = out.lines().collect();
+        let f = lines
+            .iter()
+            .position(|l| *l == "[file] f.txt (+1 -1)")
+            .expect("f.txt entry");
+        assert_eq!(&lines[f..f + 3], &["[file] f.txt (+1 -1)", "-a", "+A"]);
+        assert!(
+            lines[f + 3].starts_with("[file] g.txt"),
+            "marker after a context line leaked under +A:\n{out}"
+        );
+        let g = f + 3;
+        assert_eq!(
+            &lines[g..g + 4],
+            &[
+                "[file] g.txt (+1 -1)",
+                "-y",
+                "\\ No newline at end of file",
+                "+y"
+            ]
+        );
     }
 
     #[test]
