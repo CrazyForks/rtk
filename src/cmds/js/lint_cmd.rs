@@ -249,11 +249,16 @@ pub fn run(runner: Option<&str>, args: &[String], verbose: u8) -> Result<i32> {
         "pylint" => filter_pylint_json(&result.stdout),
         "mypy" => mypy_cmd::filter_mypy_output(&raw),
         "sqlfluff" => {
-            // Same branching as sqlfluff_cmd::run: JSON-parse via the shared
-            // filter only for lint invocations whose effective format is
-            // JSON; anything else (non-lint subcommands, or an explicit
-            // non-JSON format) shows truncated raw output.
-            if sqlfluff_is_lint
+            // On failure, sqlfluff writes diagnostics to stderr; an empty
+            // stdout does not mean "no issues".
+            if !result.success() {
+                let err = result.stderr.trim();
+                if !err.is_empty() {
+                    err.to_string()
+                } else {
+                    format!("SQLFluff: failed (exit {})", result.exit_code)
+                }
+            } else if sqlfluff_is_lint
                 && !result.stdout.trim().is_empty()
                 && (!sqlfluff_user_set_format || sqlfluff_user_json_format)
             {

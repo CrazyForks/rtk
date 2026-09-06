@@ -207,6 +207,7 @@ rtk test <cmd>                  # Generic test wrapper - failures only (-90%)
 rtk lint                        # ESLint grouped by rule/file
 rtk lint biome                  # Supports other linters
 rtk sqlfluff lint               # SQL linting (JSON, -75%)
+rtk sqlfluff lint models/       # Lint a specific directory (pass path after `lint`)
 rtk tsc                         # TypeScript errors grouped by file
 rtk next build                  # Next.js build compact
 rtk prettier --check .          # Files needing formatting
