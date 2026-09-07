@@ -1458,6 +1458,22 @@ fn run_bunx_tool(args: &[String], verbose: u8, skip_env: bool) -> Result<i32> {
     }
 }
 
+/// `awareness.level` for `rtk init`. A malformed config.toml falls back to `default` with a
+/// warning instead of silently installing the wrong awareness file.
+fn configured_awareness_level() -> core::config::AwarenessLevel {
+    match core::config::Config::load() {
+        Ok(config) => config.awareness.level,
+        Err(e) => {
+            let reason = e.to_string();
+            let first_line = reason.lines().next().unwrap_or("unreadable");
+            eprintln!(
+                "rtk: warning: could not read config.toml ({first_line}); using awareness.level = \"default\""
+            );
+            core::config::AwarenessLevel::default()
+        }
+    }
+}
+
 fn run_fallback(parse_error: clap::Error) -> Result<i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -2199,6 +2215,11 @@ fn run_cli() -> Result<i32> {
             let ctx = hooks::init::InitContext {
                 verbose: cli.verbose,
                 dry_run,
+                awareness: if show || uninstall {
+                    core::config::AwarenessLevel::default()
+                } else {
+                    configured_awareness_level()
+                },
             };
             let patch_mode = if auto_patch {
                 hooks::init::PatchMode::Auto
@@ -3246,6 +3267,7 @@ mod tests {
         let ctx = hooks::init::InitContext {
             verbose: 2,
             dry_run: true,
+            ..Default::default()
         };
 
         let result = uninstall_init_dispatch(
