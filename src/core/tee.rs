@@ -5,7 +5,7 @@ use crate::core::config::Config;
 use std::path::PathBuf;
 
 /// Minimum output size to tee (smaller outputs don't need recovery)
-const MIN_TEE_SIZE: usize = 500;
+pub(crate) const MIN_TEE_SIZE: usize = 500;
 
 /// Default max files to keep in tee directory
 const DEFAULT_MAX_FILES: usize = 20;
@@ -14,8 +14,10 @@ const DEFAULT_MAX_FILES: usize = 20;
 const DEFAULT_MAX_FILE_SIZE: usize = 1_048_576;
 
 /// Sanitize a command slug for use in filenames.
-/// Replaces non-alphanumeric chars (except underscore/hyphen) with underscore,
-/// truncates at 40 chars.
+/// Replaces non-alphanumeric chars (except underscore/hyphen) with underscore.
+/// Long slugs (usually an embedded file path that duplicates the command the LLM
+/// already issued) collapse to a short readable prefix plus a short disambiguating
+/// hash, keeping recovery filenames unique but compact — fewer tokens per tee hint.
 fn sanitize_slug(slug: &str) -> String {
     let sanitized: String = slug
         .chars()
@@ -27,11 +29,22 @@ fn sanitize_slug(slug: &str) -> String {
             }
         })
         .collect();
-    if sanitized.len() > 40 {
-        sanitized[..40].to_string()
-    } else {
-        sanitized
+    const MAX_READABLE: usize = 24;
+    if sanitized.len() <= MAX_READABLE {
+        return sanitized;
     }
+    let prefix: String = sanitized.chars().take(8).collect();
+    format!("{}_{}", prefix, short_hash(&sanitized))
+}
+
+/// First 6 hex chars (24 bits) of the SHA-256 of `s` — a compact tag to keep
+/// shortened slugs distinct. Not collision-resistant on its own: 24 bits hits a
+/// birthday collision after only a few thousand distinct slugs. It's safe here
+/// because a clash also requires the identical readable prefix *and* the same
+/// epoch second, which together scope tee writes exactly as before.
+fn short_hash(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(s.as_bytes()))[..6].to_string()
 }
 
 /// Get the tee directory, respecting config and env overrides.
@@ -102,6 +115,15 @@ fn should_tee(
     tee_dir
 }
 
+/// Creates the parent as its own step, otherwise `create_dir_all` leaves the
+/// data root at the umask as an intermediate.
+fn create_tee_dir(tee_dir: &std::path::Path) -> Option<()> {
+    if let Some(parent) = tee_dir.parent() {
+        let _ = crate::core::utils::create_private_dir(parent);
+    }
+    crate::core::utils::create_private_dir(tee_dir).ok()
+}
+
 /// Write raw output to a tee file in the given directory.
 /// Returns file path on success.
 fn write_tee_file(
@@ -111,7 +133,7 @@ fn write_tee_file(
     max_file_size: usize,
     max_files: usize,
 ) -> Option<PathBuf> {
-    std::fs::create_dir_all(tee_dir).ok()?;
+    create_tee_dir(tee_dir)?;
 
     let slug = sanitize_slug(command_slug);
     let epoch = std::time::SystemTime::now()
@@ -138,7 +160,16 @@ fn write_tee_file(
         raw.to_string()
     };
 
-    std::fs::write(&filepath, content).ok()?;
+    let mut file = crate::core::utils::open_private(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true),
+        &filepath,
+    )
+    .ok()?;
+    use std::io::Write;
+    file.write_all(content.as_bytes()).ok()?;
 
     // Rotate old files
     cleanup_old_files(tee_dir, max_files);
@@ -257,7 +288,7 @@ fn force_tee_path(content: &str, command_slug: &str) -> Option<PathBuf> {
     }
 
     let tee_dir = get_tee_dir(&config)?;
-    let tee_dir = std::fs::create_dir_all(&tee_dir).ok().and(Some(tee_dir))?;
+    let tee_dir = create_tee_dir(&tee_dir).and(Some(tee_dir))?;
 
     write_tee_file(
         content,
@@ -332,9 +363,23 @@ mod tests {
         assert_eq!(sanitize_slug("cargo test"), "cargo_test");
         assert_eq!(sanitize_slug("cargo-test"), "cargo-test");
         assert_eq!(sanitize_slug("go/test/./pkg"), "go_test___pkg");
-        // Truncate at 40
-        let long = "a".repeat(50);
-        assert_eq!(sanitize_slug(&long).len(), 40);
+        // Long slugs (embedded paths) collapse to a readable prefix + hash, staying short.
+        let long = format!("grep_0_{}", "a".repeat(50));
+        let short = sanitize_slug(&long);
+        assert!(
+            short.len() < 24,
+            "long slug should shorten, got '{}'",
+            short
+        );
+        assert!(
+            short.starts_with("grep_0_a"),
+            "keeps a readable prefix, got '{}'",
+            short
+        );
+        // Deterministic, and different slugs never collide onto the same filename.
+        assert_eq!(sanitize_slug(&long), short);
+        let other = sanitize_slug(&format!("grep_1_{}", "a".repeat(50)));
+        assert_ne!(other, short, "distinct slugs must not collide");
     }
 
     #[test]
@@ -406,6 +451,48 @@ mod tests {
         assert!(path.exists());
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("error: test failed"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_write_tee_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tee_dir = tmpdir.path().join("tee");
+        let path = write_tee_file(
+            "secret output\n",
+            "grep",
+            &tee_dir,
+            DEFAULT_MAX_FILE_SIZE,
+            20,
+        )
+        .expect("tee file written");
+
+        let mode = |p: &std::path::Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600, "tee file must be owner-only");
+        assert_eq!(mode(&tee_dir), 0o700, "tee dir must be owner-only");
+    }
+
+    // umask is process-global, so this must not run alongside another test that
+    // depends on it. Restored before the assertion can unwind.
+    #[test]
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn test_write_tee_file_owner_only_under_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // nosemgrep: unsafe-block
+        let previous = unsafe { libc::umask(0o000) };
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tee_dir = tmpdir.path().join("tee");
+        let written = write_tee_file("secret\n", "grep", &tee_dir, DEFAULT_MAX_FILE_SIZE, 20);
+        // nosemgrep: unsafe-block
+        unsafe { libc::umask(previous) };
+
+        let path = written.expect("tee file written");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "umask 000 must not widen the tee file");
     }
 
     #[test]

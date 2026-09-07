@@ -21,6 +21,45 @@ pub struct Config {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
+    #[serde(default)]
+    pub awareness: AwarenessConfig,
+}
+
+/// How much the agent is told about RTK by the instructions file `rtk init` writes.
+///
+/// - `default`: output contract only. The agent never learns rtk exists.
+/// - `high`: adds what RTK is and its meta commands (`rtk gain`, `rtk proxy`, `RTK_DISABLED=1`).
+/// - `full`: adds "prefix every command with `rtk`". Required for agents without a command
+///   hook; those agents always receive `full` regardless of this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AwarenessLevel {
+    #[default]
+    Default,
+    High,
+    Full,
+}
+
+impl AwarenessLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AwarenessLevel::Default => "default",
+            AwarenessLevel::High => "high",
+            AwarenessLevel::Full => "full",
+        }
+    }
+}
+
+impl std::fmt::Display for AwarenessLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct AwarenessConfig {
+    #[serde(default)]
+    pub level: AwarenessLevel,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -150,6 +189,40 @@ pub fn limits() -> LimitsConfig {
     Config::load().map(|c| c.limits).unwrap_or_default()
 }
 
+/// Get `(exclude_commands, transparent_prefixes)` for hook-rewrite decisions.
+/// Falls back to empty (no exclusions/prefixes) if config can't be loaded.
+/// Shared by every place that decides whether/how to rewrite a command
+/// (`hooks::hook_cmd`, `hooks::rewrite_cmd`, `discover`, `rtk rewrite`'s CLI
+/// entry point in `main.rs`) so they can't drift from each other.
+///
+/// Reads the process-wide cached config (see `cached_config`), not a fresh
+/// `Config::load()`: this is on the PreToolUse hook's hot path, and
+/// `tracking::get_db_path` (called via `Tracker::new()` for `hook_decisions`
+/// logging, right after this in the same hook invocation) also reads config —
+/// without caching, that's two full disk-read-plus-TOML-parse round trips per
+/// single Bash tool call instead of one.
+pub fn hook_rewrite_params() -> (Vec<String>, Vec<String>) {
+    let c = cached_config();
+    (
+        c.hooks.exclude_commands.clone(),
+        c.hooks.transparent_prefixes.clone(),
+    )
+}
+
+/// Process-wide cached `Config::load()` result, populated on first use.
+///
+/// Safe for read-only callers on hot paths that may load config multiple times
+/// within a single `rtk` invocation (a `rtk` process is short-lived and exits
+/// after one subcommand, so there's no cross-invocation staleness to worry
+/// about) — but NOT used by any path that mutates and saves config within the
+/// same process run (e.g. `hooks::init::save_telemetry_consent`'s load-mutate-save),
+/// since those must always observe a fresh read. Only reach for this from a
+/// caller that never itself writes config.toml.
+pub(crate) fn cached_config() -> &'static Config {
+    static CACHE: std::sync::OnceLock<Config> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Config::load().unwrap_or_default())
+}
+
 impl Config {
     pub fn load() -> Result<Self> {
         let path = get_config_path()?;
@@ -217,6 +290,55 @@ exclude_commands = ["curl", "gh"]
 "#;
         let config: Config = toml::from_str(toml).expect("valid toml");
         assert_eq!(config.hooks.exclude_commands, vec!["curl", "gh"]);
+    }
+
+    #[test]
+    fn test_awareness_level_deserialize_each_variant() {
+        for (raw, expected) in [
+            ("default", AwarenessLevel::Default),
+            ("high", AwarenessLevel::High),
+            ("full", AwarenessLevel::Full),
+        ] {
+            let toml = format!("[awareness]\nlevel = \"{raw}\"\n");
+            let config: Config = toml::from_str(&toml).expect("valid toml");
+            assert_eq!(config.awareness.level, expected, "level = {raw}");
+        }
+    }
+
+    #[test]
+    fn test_awareness_level_defaults_when_missing() {
+        let config: Config = toml::from_str("").expect("valid toml");
+        assert_eq!(config.awareness.level, AwarenessLevel::Default);
+
+        let config: Config = toml::from_str("[awareness]\n").expect("valid toml");
+        assert_eq!(config.awareness.level, AwarenessLevel::Default);
+    }
+
+    #[test]
+    fn test_awareness_level_rejects_unknown_value() {
+        let result: Result<Config, _> = toml::from_str("[awareness]\nlevel = \"max\"\n");
+        assert!(
+            result.is_err(),
+            "unknown awareness level must be a parse error"
+        );
+    }
+
+    #[test]
+    fn test_awareness_level_round_trips_through_default_config() {
+        let serialized = toml::to_string_pretty(&Config::default()).expect("serializable");
+        assert!(
+            serialized.contains("[awareness]") && serialized.contains("level = \"default\""),
+            "rtk config must show the awareness level, got:\n{serialized}"
+        );
+        let parsed: Config = toml::from_str(&serialized).expect("round trip");
+        assert_eq!(parsed.awareness.level, AwarenessLevel::Default);
+    }
+
+    #[test]
+    fn test_awareness_level_display_matches_toml_value() {
+        assert_eq!(AwarenessLevel::Default.to_string(), "default");
+        assert_eq!(AwarenessLevel::High.to_string(), "high");
+        assert_eq!(AwarenessLevel::Full.to_string(), "full");
     }
 
     #[test]

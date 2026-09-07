@@ -42,6 +42,7 @@ ignore_files = ["*.lock", "*.min.js", "*.min.css"]
 enabled = true              # save raw output on failure
 mode = "failures"           # "failures" (default), "always", "never"
 max_files = 20              # rotation: keep last N files
+max_file_size = 1048576     # 1 MB in bytes
 # directory = "/custom/tee/path"  # optional override
 
 [telemetry]
@@ -49,9 +50,33 @@ enabled = true              # anonymous daily ping — see Telemetry & Privacy f
 
 [hooks]
 exclude_commands = []       # commands to never auto-rewrite
+
+[awareness]
+level = "default"           # "default", "high", "full" — see Awareness level
 ```
 
 For full details on what is collected, opt-out options, and GDPR rights, see [Telemetry & Privacy](../resources/telemetry.md).
+
+## Awareness level
+
+`rtk init` writes a short instructions file for your agent (`~/.claude/RTK.md`, `~/.gemini/GEMINI.md`, …).
+`awareness.level` sets how much it says about RTK. Output is condensed the same way at every level.
+
+| Level | The agent is told | Pick it when |
+|-------|-------------------|--------------|
+| `default` | How to read condensed output. Nothing about RTK. | Hook-based agent, RTK stays invisible. |
+| `high` | `default` + what RTK is and `rtk gain`, `rtk proxy`, `RTK_DISABLED=1`, `rtk discover`. | You want to ask the agent about savings or to bypass RTK. |
+| `full` | `high` + "prefix every command with `rtk`". | Agent without a hook, or you want the agent to drive RTK itself. |
+
+```toml
+[awareness]
+level = "high"
+```
+
+Re-run `rtk init -g` (or your agent's init command) to rewrite the file.
+
+Agents without a hook (Codex CLI, Cline, Windsurf, Kilo Code, Antigravity, Kimi) always get `full`,
+since the agent must type `rtk` itself. `rtk init` prints a note when it does this.
 
 ## Environment variables
 
@@ -91,9 +116,33 @@ Prevent specific commands from being rewritten by the hook:
 exclude_commands = ["git rebase", "git cherry-pick", "docker exec"]
 ```
 
-Patterns match against the full command after stripping env prefixes (`sudo`, `VAR=val`), so `"psql"` excludes both `psql -h localhost` and `PGPASSWORD=x psql -h localhost`.
+Patterns match against the full command after stripping env prefixes (`VAR=val`), so `"psql"` excludes both `psql -h localhost` and `PGPASSWORD=x psql -h localhost`.
 
 Subcommand patterns work too: `"git push"` excludes `git push origin main` but not `git status`.
+
+An entry names a tool RTK has a filter for, and covers the wrapper, interpreter and path spellings
+of it. Before matching, RTK peels those off the command and matches what is left, so
+`"playwright"` excludes `playwright test`, `npx playwright test` and `pnpm exec playwright test`
+alike; `"pytest"` also covers `python3 -m pytest tests/`, and `"phpunit"` covers
+`vendor/bin/phpunit` and `php vendor/bin/phpunit`.
+
+Three spellings are not peeled yet, and still rewrite despite a matching entry:
+
+| Entry | Command | Why |
+|---|---|---|
+| `"head"`, `"tail"` | `head -20 f`, `tail -n 5 f` | The line-range form takes a fast path that returns before the exclusion is consulted ([#2823](https://github.com/rtk-ai/rtk/issues/2823)). Without a line range, `head f` is excluded normally. |
+| `"gradlew"`, `"mvn"` | `gradlew.bat build`, `mvnw.cmd test` | Path stripping splits on `/`, so a `.bat`/`.cmd` spelling never reduces to the tool name. `./gradlew` and `gradlew` are both excluded ([#3617](https://github.com/rtk-ai/rtk/pull/3617)). |
+| `"golangci-lint"` | `golangci run ./...` | `golangci run` is one of the rule's own aliases and is kept whole, so it does not match the `golangci-lint` entry. Exclude `"golangci"` as well to cover it. |
+
+A tool RTK has no filter of its own for is matched as typed, because RTK only sees the wrapper:
+with `["my-tool"]`, `npx my-tool` still rewrites to `rtk npx my-tool`. Exclude `"npx"` to stop
+that.
+
+The arguments are kept when peeling, so an anchored pattern still narrows the way you wrote it:
+`"^ls$"` excludes a bare `ls` without swallowing `ls -la`. Matching stays exact — `"go"` never
+excludes `golangci-lint`, subcommand patterns stay literal (`"git push"` does not widen to all of
+`git`), and an entry never leaks to a different tool that happens to share an RTK filter: `"read"`
+does not exclude `cat`, and `"eslint"` does not exclude `biome`.
 
 Patterns starting with `^` are treated as regex:
 
