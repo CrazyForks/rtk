@@ -501,6 +501,14 @@ pub const RULES: &[RtkRule] = &[
         ..RtkRule::DEFAULT
     },
     RtkRule {
+        pattern: r"^sqlfluff\s+lint",
+        rtk_cmd: "rtk sqlfluff",
+        rewrite_prefixes: &["sqlfluff"],
+        category: "Python",
+        savings_pct: 75.0,
+        ..RtkRule::DEFAULT
+    },
+    RtkRule {
         pattern: r"^(python[0-9.]*\s+-m\s+)?pytest(\s|$)",
         rtk_cmd: "rtk pytest",
         pipeline_safety: PipelineSafety::ProducerOnly,
