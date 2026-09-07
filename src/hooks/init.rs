@@ -74,6 +74,7 @@ const RTK_MD_REF: &str = "@RTK.md";
 const GEMINI_MD: &str = "GEMINI.md";
 
 const RTK_BLOCK_START: &str = "<!-- rtk-instructions";
+const RTK_BLOCK_VERSION: &str = "v2";
 const RTK_BLOCK_END: &str = "<!-- /rtk-instructions -->";
 
 /// Control flow for settings.json patching
@@ -145,7 +146,7 @@ fn print_rules_only_awareness_note(agent: &str, ctx: InitContext) {
 /// Wrap an awareness file in the `<!-- rtk-instructions -->` markers used by
 /// `write_rtk_block`, so it can be upserted into a shared file like AGENTS.md.
 fn rtk_block(body: &str) -> String {
-    format!("{RTK_BLOCK_START} v2 -->\n{body}{RTK_BLOCK_END}\n")
+    format!("{RTK_BLOCK_START} {RTK_BLOCK_VERSION} -->\n{body}{RTK_BLOCK_END}\n")
 }
 
 /// Shared dry-run footer printed at the end of every init sub-mode.
@@ -1194,8 +1195,15 @@ fn run_default_mode(
 ) -> Result<()> {
     let InitContext { dry_run, .. } = ctx;
     if !global {
-        // Local init: inject CLAUDE.md + generate project-local filters template
-        run_claude_md_mode(false, install_opencode, ctx)?;
+        // Local init: inject the awareness block into CLAUDE.md + generate
+        // project-local filters template. The legacy full-instruction block
+        // stays behind the explicit --claude-md opt-in.
+        run_claude_md_mode_with(
+            false,
+            install_opencode,
+            &rtk_block(awareness_content(ctx.awareness)),
+            ctx,
+        )?;
         generate_project_filters_template(ctx)?;
         return Ok(());
     }
@@ -1240,7 +1248,10 @@ fn run_default_mode(
 
         if migrated {
             println!("\n  [ok] Migrated: removed 137-line RTK block from CLAUDE.md");
-            println!("              replaced with @RTK.md (10 lines)");
+            println!(
+                "              replaced with @RTK.md (awareness: {})",
+                ctx.awareness
+            );
         }
     }
 
@@ -1626,8 +1637,17 @@ fn run_hook_only_mode(
     Ok(())
 }
 
-/// Legacy mode: full 137-line injection into CLAUDE.md
+/// Legacy mode (--claude-md): inject the full RTK_INSTRUCTIONS block into CLAUDE.md.
 fn run_claude_md_mode(global: bool, install_opencode: bool, ctx: InitContext) -> Result<()> {
+    run_claude_md_mode_with(global, install_opencode, RTK_INSTRUCTIONS, ctx)
+}
+
+fn run_claude_md_mode_with(
+    global: bool,
+    install_opencode: bool,
+    block: &str,
+    ctx: InitContext,
+) -> Result<()> {
     let InitContext {
         verbose, dry_run, ..
     } = ctx;
@@ -1653,13 +1673,7 @@ fn run_claude_md_mode(global: bool, install_opencode: bool, ctx: InitContext) ->
         "rtk init --claude-md"
     };
 
-    let action = write_rtk_block(
-        &path,
-        RTK_INSTRUCTIONS,
-        "rtk instructions",
-        recovery_cmd,
-        ctx,
-    )?;
+    let action = write_rtk_block(&path, block, "rtk instructions", recovery_cmd, ctx)?;
 
     if matches!(action, RtkBlockUpsert::Unchanged) {
         return Ok(());
@@ -2014,10 +2028,10 @@ fn run_kimi_mode_at(base_dir: &Path, ctx: InitContext) -> Result<()> {
         ctx,
     )?;
 
+    print_rules_only_awareness_note("Kimi AI", ctx);
     if !ctx.dry_run {
         println!("\nRTK configured for Kimi AI.\n");
         println!("  AGENTS.md: {}", agents_md_path.display());
-        print_rules_only_awareness_note("Kimi AI", ctx);
         println!("  Kimi AI will now use rtk commands for token savings.");
         println!("  Test with: git status\n");
     }
@@ -2484,10 +2498,10 @@ fn run_codex_mode_with_paths(
     write_if_changed(&rtk_md_path, RTK_AWARENESS_FULL, RTK_MD, ctx)?;
     let added_ref = patch_agents_md(&agents_md_path, &rtk_md_ref, ctx)?;
 
+    print_rules_only_awareness_note("Codex CLI", ctx);
     if !dry_run {
         println!("\nRTK configured for Codex CLI.\n");
         println!("  RTK.md:    {}", rtk_md_path.display());
-        print_rules_only_awareness_note("Codex CLI", ctx);
         if added_ref {
             println!("  AGENTS.md: {} reference added", rtk_md_ref);
         } else {
@@ -5413,6 +5427,23 @@ mod tests {
             high_ctx
         )
         .unwrap());
+    }
+
+    #[test]
+    fn test_local_init_block_follows_awareness_level_not_legacy() {
+        for level in [
+            AwarenessLevel::Default,
+            AwarenessLevel::High,
+            AwarenessLevel::Full,
+        ] {
+            let block = rtk_block(awareness_content(level));
+            assert!(block.starts_with(RTK_BLOCK_START));
+            assert!(block.contains(awareness_content(level).trim_end()));
+        }
+        // Plain local init must not ship the legacy Golden Rule; --claude-md keeps it.
+        assert!(!rtk_block(awareness_content(AwarenessLevel::Default)).contains("Golden Rule"));
+        assert!(!rtk_block(awareness_content(AwarenessLevel::High)).contains("Golden Rule"));
+        assert!(RTK_INSTRUCTIONS.contains("Golden Rule"));
     }
 
     #[test]

@@ -2033,7 +2033,11 @@ fn run_cli() -> Result<i32> {
             let ctx = hooks::init::InitContext {
                 verbose: cli.verbose,
                 dry_run,
-                awareness: configured_awareness_level(),
+                awareness: if show || uninstall {
+                    core::config::AwarenessLevel::default()
+                } else {
+                    configured_awareness_level()
+                },
             };
             if show {
                 hooks::init::show_config(codex)?;
