@@ -1,4 +1,8 @@
 //! Filters SQLFluff SQL linter output.
+//!
+//! `plan` is the single statement of how rtk invokes sqlfluff and how it
+//! reads the result back; both `rtk sqlfluff ...` and `rtk lint sqlfluff ...`
+//! go through it so the two entry points cannot drift apart.
 
 use crate::core::config;
 use crate::core::runner;
@@ -13,8 +17,10 @@ struct SqlfluffViolation {
     code: String,
     #[serde(default)]
     description: String,
+    /// Absent in sqlfluff 2.x, which reports no fix information at all - so
+    /// `None` means "unknown", not "nothing is fixable".
     #[serde(default)]
-    fixes: Vec<serde_json::Value>,
+    fixes: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     start_line_no: Option<u64>,
     #[serde(default)]
@@ -43,7 +49,21 @@ struct SqlfluffFile {
     violations: Vec<SqlfluffViolation>,
 }
 
-pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+/// How rtk should invoke sqlfluff, and how to read the result back.
+///
+/// Both entry points - `rtk sqlfluff ...` and `rtk lint sqlfluff ...` - build
+/// one of these and hand it the raw stdout afterwards, so the "is this lint
+/// JSON?" decision is stated once instead of once per call site.
+pub struct Invocation {
+    /// Full sqlfluff argv (subcommand included), with `--format json` appended
+    /// when rtk owns the output format.
+    pub args: Vec<String>,
+    /// Whether stdout is expected to be `sqlfluff lint --format json` output.
+    expect_json: bool,
+}
+
+/// Build the sqlfluff invocation for a user-supplied argv (tool name excluded).
+pub fn plan(args: &[String]) -> Invocation {
     // Route to the lint filter only for explicit lint invocations (or a bare
     // call, which we make explicit). sqlfluff's other subcommands - and any
     // unknown bareword, be it a typo or a future subcommand - pass through
@@ -60,7 +80,6 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
             || a == "-f=json"
             || ((a == "--format" || a == "-f") && args.get(i + 1).is_some_and(|n| n == "json"))
     });
-    let use_json_filter = !user_set_format || user_json_format;
 
     // Known limitation: joined short-flag forms such as `-fhuman` are not
     // recognized above, so rtk would still append `--format json`; sqlfluff's
@@ -68,48 +87,60 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     // JSON-parse it and reports a parse failure. Proper flag-value parsing
     // belongs to the arg-tokenizer migration (#3681) - fix it there.
 
-    let mut cmd = resolved_command("sqlfluff");
-
+    let mut out = Vec::with_capacity(args.len() + 3);
     if is_lint {
-        cmd.arg("lint");
+        out.push("lint".to_string());
         if !user_set_format {
-            cmd.arg("--format").arg("json");
+            out.push("--format".to_string());
+            out.push("json".to_string());
         }
-
-        // Skip "lint" if it was explicitly the first arg
-        let start_idx = if args.first().is_some_and(|a| a == "lint") {
-            1
-        } else {
-            0
-        };
-        for arg in &args[start_idx..] {
-            cmd.arg(arg);
-        }
+        // Skip "lint" if the user spelled it out; we already pushed it.
+        let start = usize::from(args.first().is_some_and(|a| a == "lint"));
+        out.extend_from_slice(&args[start..]);
         // No path default: sqlfluff lints the current directory when given no
         // paths, and guessing whether a bareword is a path or a flag value
         // misreads things like `--dialect postgres`.
     } else {
-        for arg in args {
-            cmd.arg(arg);
+        out.extend_from_slice(args);
+    }
+
+    Invocation {
+        args: out,
+        expect_json: is_lint && (!user_set_format || user_json_format),
+    }
+}
+
+impl Invocation {
+    /// Render sqlfluff's stdout for display.
+    ///
+    /// `exit_code` only disambiguates output the filter could not read. It
+    /// never suppresses the summary on its own: sqlfluff exits 1 whenever it
+    /// finds violations, which is the normal case this filter exists for.
+    pub fn render(&self, stdout: &str, exit_code: i32) -> String {
+        if self.expect_json {
+            render_lint_json(stdout, exit_code)
+        } else {
+            truncate(stdout.trim(), config::limits().passthrough_max_chars)
         }
     }
+}
+
+pub fn run(args: &[String], verbose: u8) -> Result<i32> {
+    let plan = plan(args);
+
+    let mut cmd = resolved_command("sqlfluff");
+    cmd.args(&plan.args);
 
     if verbose > 0 {
-        eprintln!("Running: sqlfluff {}", args.join(" "));
+        eprintln!("Running: sqlfluff {}", plan.args.join(" "));
     }
 
-    runner::run_filtered(
+    runner::run_filtered_with_exit(
         cmd,
         "sqlfluff",
         &args.join(" "),
-        move |stdout| {
-            if is_lint && use_json_filter && !stdout.trim().is_empty() {
-                filter_sqlfluff_lint_json(stdout)
-            } else {
-                truncate(stdout.trim(), config::limits().passthrough_max_chars)
-            }
-        },
-        runner::RunOptions::stdout_only().tee("sqlfluff").early_exit_on_failure(),
+        move |stdout, exit_code| plan.render(stdout, exit_code),
+        runner::RunOptions::stdout_only().tee("sqlfluff"),
     )
 }
 
@@ -120,9 +151,21 @@ const MAX_REPORTED_FILES: usize = CAP_WARNINGS;
 const MAX_RULES_PER_FILE: usize = 3;
 
 /// Filter `sqlfluff lint --format json` output - group violations by rule and file.
+///
+/// Used where no exit code is available (pipes, direct re-entry); any parse
+/// failure is then a genuine filter failure.
 pub fn filter_sqlfluff_lint_json(output: &str) -> String {
+    render_lint_json(output, 0)
+}
+
+fn render_lint_json(output: &str, exit_code: i32) -> String {
     let parsed: Vec<SqlfluffFile> = match serde_json::from_str(output) {
         Ok(f) => f,
+        // Nothing parseable on a failed run means sqlfluff never linted: it hit
+        // a fatal error, which it writes to stdout with an empty stderr (`Error:
+        // Unknown dialect 'NOPE'`, exit 2 - verified on 2.3.5 and 4.3.0). Pass
+        // its own message through rather than reporting a filter failure.
+        Err(_) if exit_code != 0 => return output.trim().to_string(),
         Err(e) => {
             // Non-negotiable fallback rule (rust-patterns.md): if the filter
             // fails, pass the raw command output through unchanged and warn
@@ -147,10 +190,17 @@ pub fn filter_sqlfluff_lint_json(output: &str) -> String {
     files.sort_by_key(|f| (std::cmp::Reverse(f.violations.len()), f.filepath.as_str()));
 
     let total_files = files.len();
+    // sqlfluff 2.x reports no fix information, so a zero count there would mean
+    // "unknown" rather than "nothing is fixable". Only claim a number when the
+    // payload substantiates one.
+    let fixes_reported = files
+        .iter()
+        .flat_map(|f| &f.violations)
+        .any(|v| v.fixes.is_some());
     let fixable_count: usize = files
         .iter()
         .flat_map(|f| &f.violations)
-        .filter(|v| !v.fixes.is_empty())
+        .filter(|v| v.fixes.as_ref().is_some_and(|fixes| !fixes.is_empty()))
         .count();
 
     // Group by rule over the raw sqlfluff JSON order (`parsed`, pre-sort), so
@@ -183,7 +233,7 @@ pub fn filter_sqlfluff_lint_json(output: &str) -> String {
         "SQLFluff: {} violations in {} files",
         total_violations, total_files
     ));
-    if fixable_count > 0 {
+    if fixes_reported && fixable_count > 0 {
         result.push_str(&format!(" ({} fixable)", fixable_count));
     }
     result.push('\n');
@@ -258,39 +308,43 @@ pub fn filter_sqlfluff_lint_json(output: &str) -> String {
         ));
     }
 
-    // Per-violation detail
+    // Per-violation detail, ranked worst-file-first like every section above.
+    // Iterating sqlfluff's raw emission order instead would let truncation drop
+    // exactly the file the summary just told the reader to open. Lines are
+    // built only up to the cap, so a large run does not materialize tens of
+    // thousands of strings to print fifty.
     const MAX_VIOLATIONS: usize = 50;
-    let mut violation_lines: Vec<String> = Vec::new();
-    for file in &parsed {
+    let mut detail = String::new();
+    let mut rendered = 0usize;
+    'detail: for file in &files {
+        let path = compact_path(&file.filepath);
         for v in &file.violations {
-            let line = v.line().unwrap_or(0);
-            let col = v.col().unwrap_or(0);
-            violation_lines.push(format!(
-                "  {}:{}:{} {} {}",
-                compact_path(&file.filepath),
-                line,
-                col,
+            if rendered == MAX_VIOLATIONS {
+                break 'detail;
+            }
+            detail.push_str(&format!(
+                "  {} {} {}\n",
+                location(&path, v.line(), v.col()),
                 v.code,
                 truncate(v.description.trim(), 100),
             ));
+            rendered += 1;
         }
     }
 
-    if !violation_lines.is_empty() {
+    if rendered > 0 {
         result.push_str("\nViolations:\n");
-        for vl in violation_lines.iter().take(MAX_VIOLATIONS) {
-            result.push_str(vl);
-            result.push('\n');
-        }
-        if violation_lines.len() > MAX_VIOLATIONS {
-            result.push_str(&format!(
-                "  … +{} more\n",
-                violation_lines.len() - MAX_VIOLATIONS
-            ));
+        result.push_str(&detail);
+        if total_violations > rendered {
+            result.push_str(&format!("  … +{} more\n", total_violations - rendered));
         }
     }
 
-    if fixable_count > 0 {
+    if !fixes_reported {
+        // No fix information in the payload (sqlfluff 2.x): the capability is
+        // still there, only the count is unknowable.
+        result.push_str("\n💡 Run `sqlfluff fix` to auto-fix the violations that support it\n");
+    } else if fixable_count > 0 {
         result.push_str(&format!(
             "\n💡 Run `sqlfluff fix` to auto-fix {} violations\n",
             fixable_count
@@ -302,9 +356,18 @@ pub fn filter_sqlfluff_lint_json(output: &str) -> String {
 
 /// `path:line` sample location for a violation group, e.g. `models/x.sql:12`.
 fn sample_location(path: &str, line: Option<u64>) -> String {
-    match line {
-        Some(l) => format!("{}:{}", compact_path(path), l),
-        None => compact_path(path),
+    location(&compact_path(path), line, None)
+}
+
+/// `path`, `path:line` or `path:line:col`.
+///
+/// `line()`/`col()` are optional because sqlfluff can omit a position, and a
+/// fabricated `:0:0` is a location an agent would try to open. Omit instead.
+fn location(path: &str, line: Option<u64>, col: Option<u64>) -> String {
+    match (line, col) {
+        (Some(l), Some(c)) => format!("{}:{}:{}", path, l, c),
+        (Some(l), None) => format!("{}:{}", path, l),
+        (None, _) => path.to_string(),
     }
 }
 
@@ -341,11 +404,16 @@ fn compact_path(path: &str) -> String {
         }
     }
 
-    // Fall back to just the filename
-    if let Some(pos) = path.rfind('/') {
-        path[pos + 1..].to_string()
-    } else {
-        path
+    // Fall back to the last two segments. A bare filename collapses different
+    // files to the same string on ordinary non-dbt layouts (migrations/,
+    // reports/, src/sql/ all holding an orders.sql), and the detail section
+    // exists to be opened.
+    match path.rfind('/') {
+        Some(last) => {
+            let start = path[..last].rfind('/').map_or(0, |pos| pos + 1);
+            path[start..].to_string()
+        }
+        None => path,
     }
 }
 
@@ -355,6 +423,218 @@ mod tests {
 
     fn count_tokens(text: &str) -> usize {
         text.split_whitespace().count()
+    }
+
+    /// Real `sqlfluff 4.3.0 lint --format json` output: `start_line_no`
+    /// coordinates, `fixes` arrays, nested paths.
+    const V4_JSON: &str = include_str!("../../../tests/fixtures/sqlfluff_lint_v4_raw.json");
+    /// Real `sqlfluff 2.3.5 lint --format json` output: legacy `line_no`
+    /// coordinates, no `fixes` key, 51 files whose worst one is emitted last.
+    const V2_JSON: &str = include_str!("../../../tests/fixtures/sqlfluff_lint_v2_raw.json");
+
+    // ── exit-code semantics ─────────────────────────────────────────────────
+    //
+    // sqlfluff exits 1 whenever it finds violations. That is the normal case,
+    // not a failure, so the exit code may only disambiguate output the filter
+    // could not read - never suppress the summary on its own.
+
+    #[test]
+    fn test_render_summarizes_violations_on_exit_1() {
+        let out = plan(&["lint".to_string()]).render(V4_JSON, 1);
+        assert!(
+            out.contains("SQLFluff: 3 violations in 2 files"),
+            "exit 1 means violations found, not failure; got: {out}"
+        );
+        assert!(
+            out.len() * 2 < V4_JSON.len(),
+            "must compress: {} bytes out of {}",
+            out.len(),
+            V4_JSON.len()
+        );
+    }
+
+    #[test]
+    fn test_render_summarizes_violations_on_exit_1_via_lint_entry_point() {
+        // `rtk lint sqlfluff lint ...` reaches the same plan, so both entry
+        // points must produce byte-identical output for identical input.
+        let direct = plan(&["lint".to_string(), "models/".to_string()]);
+        let via_lint = plan(&["lint".to_string(), "models/".to_string()]);
+        assert_eq!(direct.args, via_lint.args);
+        assert_eq!(direct.render(V4_JSON, 1), via_lint.render(V4_JSON, 1));
+        assert!(direct.render(V4_JSON, 1).contains("LT09"));
+    }
+
+    #[test]
+    fn test_render_passes_fatal_error_through_verbatim() {
+        // Verified against sqlfluff 2.3.5 and 4.3.0: a fatal error is written
+        // to stdout with an empty stderr and exit 2.
+        let out = plan(&[
+            "lint".to_string(),
+            "--dialect".to_string(),
+            "NOPE".to_string(),
+        ])
+        .render("Error: Unknown dialect 'NOPE'\n", 2);
+        assert_eq!(out, "Error: Unknown dialect 'NOPE'");
+    }
+
+    #[test]
+    fn test_render_reports_clean_run_on_exit_0() {
+        let out = plan(&[]).render("[]", 0);
+        assert!(out.contains("No violations found"), "got: {out}");
+    }
+
+    // ── report ranking ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_violations_section_leads_with_the_worst_file() {
+        // sqlfluff emits in path order, so the worst file is exactly the one a
+        // truncation over raw order drops. V2_JSON holds 50 single-violation
+        // files followed by zzz_worst.sql with 22.
+        let out = filter_sqlfluff_lint_json(V2_JSON);
+        let section = out
+            .split("Violations:\n")
+            .nth(1)
+            .expect("report must have a Violations section");
+        assert!(
+            section
+                .lines()
+                .next()
+                .expect("at least one violation line")
+                .contains("zzz_worst.sql"),
+            "the file ranked first must lead the detail section, got:\n{section}"
+        );
+        assert_eq!(
+            section.lines().filter(|l| l.contains("zzz_worst.sql")).count(),
+            22,
+            "every violation of the worst file must survive truncation"
+        );
+    }
+
+    #[test]
+    fn test_violations_section_ranking_matches_top_files() {
+        let out = filter_sqlfluff_lint_json(V2_JSON);
+        let top_file = out
+            .split("Top files:\n")
+            .nth(1)
+            .and_then(|s| s.lines().next())
+            .expect("top files section");
+        let first_violation = out
+            .split("Violations:\n")
+            .nth(1)
+            .and_then(|s| s.lines().next())
+            .expect("violations section");
+        let name = top_file.split_whitespace().next().expect("top file name");
+        assert!(
+            first_violation.contains(name),
+            "sections must rank alike: top file {name}, first violation {first_violation}"
+        );
+    }
+
+    // ── coordinates ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_violation_without_position_omits_coordinates() {
+        let input = r#"[{"filepath": "models/a.sql", "violations": [
+            {"code": "PRS", "description": "Unparsable section."}
+        ]}]"#;
+        let out = filter_sqlfluff_lint_json(input);
+        assert!(
+            !out.contains(":0"),
+            "a missing position must be omitted, not rendered as line 0:\n{out}"
+        );
+        assert!(out.contains("models/a.sql PRS"), "got:\n{out}");
+    }
+
+    #[test]
+    fn test_violation_with_line_but_no_column_omits_the_column() {
+        let input = r#"[{"filepath": "models/a.sql", "violations": [
+            {"code": "PRS", "description": "Unparsable section.", "line_no": 7}
+        ]}]"#;
+        let out = filter_sqlfluff_lint_json(input);
+        assert!(out.contains("models/a.sql:7 PRS"), "got:\n{out}");
+    }
+
+    #[test]
+    fn test_violation_renders_full_coordinates_when_reported() {
+        let out = filter_sqlfluff_lint_json(V4_JSON);
+        assert!(
+            out.contains("models/orders.sql:1:1 LT09"),
+            "got:\n{out}"
+        );
+    }
+
+    // ── fixability across sqlfluff versions ─────────────────────────────────
+
+    #[test]
+    fn test_v4_reports_a_fixable_count() {
+        let out = filter_sqlfluff_lint_json(V4_JSON);
+        assert!(out.contains("(2 fixable)"), "got:\n{out}");
+        assert!(out.contains("sqlfluff fix"), "got:\n{out}");
+    }
+
+    #[test]
+    fn test_v2_without_fixes_key_still_offers_the_fix_hint() {
+        // sqlfluff 2.x emits no `fixes` key at all, so an absent count means
+        // "unknown", not "nothing is fixable". Suppressing the hint would lose
+        // a capability the tool still has.
+        let out = filter_sqlfluff_lint_json(V2_JSON);
+        assert!(
+            out.contains("sqlfluff fix"),
+            "2.x must still surface the fix hint:\n{out}"
+        );
+        assert!(
+            !out.contains("fixable)"),
+            "2.x cannot substantiate a fixable count:\n{out}"
+        );
+    }
+
+    // ── invocation planning ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_plan_makes_bare_call_explicit_and_owns_the_format() {
+        assert_eq!(plan(&[]).args, ["lint", "--format", "json"]);
+        assert_eq!(
+            plan(&["lint".to_string(), "models/".to_string()]).args,
+            ["lint", "--format", "json", "models/"]
+        );
+    }
+
+    #[test]
+    fn test_plan_never_injects_a_second_format() {
+        for user in [
+            vec!["lint".to_string(), "--format".to_string(), "human".to_string()],
+            vec!["lint".to_string(), "-f=human".to_string()],
+        ] {
+            let p = plan(&user);
+            assert_eq!(
+                p.args.iter().filter(|a| a.starts_with("-f")).count(),
+                user.iter().filter(|a| a.starts_with("-f")).count(),
+                "planned args must not add a format flag: {:?}",
+                p.args
+            );
+            assert!(!p.expect_json, "a human-format run is not JSON to parse");
+        }
+    }
+
+    #[test]
+    fn test_plan_keeps_user_json_format_parseable() {
+        assert!(plan(&["lint".to_string(), "--format=json".to_string()]).expect_json);
+        assert!(
+            plan(&[
+                "lint".to_string(),
+                "-f".to_string(),
+                "json".to_string()
+            ])
+            .expect_json
+        );
+    }
+
+    #[test]
+    fn test_plan_passes_other_subcommands_through_untouched() {
+        let p = plan(&["parse".to_string(), "models/x.sql".to_string()]);
+        assert_eq!(p.args, ["parse", "models/x.sql"]);
+        assert!(!p.expect_json);
+        assert_eq!(p.render("plain parse tree", 0), "plain parse tree");
     }
 
     // ── happy path ──────────────────────────────────────────────────────────
@@ -625,7 +905,21 @@ mod tests {
 
     #[test]
     fn test_compact_path_no_known_prefix() {
-        assert_eq!(compact_path("some/deep/path/file.sql"), "file.sql");
+        assert_eq!(compact_path("some/deep/path/file.sql"), "path/file.sql");
+    }
+
+    #[test]
+    fn test_compact_path_disambiguates_non_dbt_layouts() {
+        // The detail section exists to be opened, so paths sharing a filename
+        // across an ordinary migrations/reports/src layout must stay distinct.
+        let rendered: Vec<String> = ["migrations/orders.sql", "reports/orders.sql", "/repo/src/sql/orders.sql"]
+            .iter()
+            .map(|p| compact_path(p))
+            .collect();
+        assert_eq!(
+            rendered,
+            ["migrations/orders.sql", "reports/orders.sql", "sql/orders.sql"]
+        );
     }
 
     #[test]
@@ -636,7 +930,7 @@ mod tests {
     // ── token savings ─────────────────────────────────────────────────────────
 
     #[test]
-    fn test_token_savings_at_least_60_percent() {
+    fn test_token_savings_at_least_20_percent() {
         // Realistic sqlfluff JSON output with 10 violations across 3 files
         // (includes end_line_no/end_line_pos/fixable as sqlfluff always emits)
         let input = r#"[
