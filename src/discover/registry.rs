@@ -3253,6 +3253,68 @@ mod tests {
         );
     }
 
+    fn assert_consumer_flag_blocks_rewrite(consumer: &str, spelling: &str) {
+        let cmd = format!("git log | {consumer} {spelling}");
+        assert_eq!(rewrite_command_no_prefixes(&cmd, &[]), None, "{cmd}");
+    }
+
+    /// Every shell spelling of a consumer's unsafe flag must keep the producer raw.
+    /// Driven off `SAFE_PIPE_CONSUMERS` so a consumer added later is covered on arrival:
+    /// `getopt_long` accepts any unambiguous prefix of a long option, and the shell strips
+    /// quotes and backslashes before the flag ever reaches the consumer.
+    #[test]
+    fn test_unsafe_consumer_flag_spellings_stay_raw() {
+        for consumer in SAFE_PIPE_CONSUMERS {
+            for flag in consumer.unsafe_flags {
+                let name = flag
+                    .strip_prefix("--")
+                    .expect("unsafe_flags entries are long options");
+                for len in 1..=name.len() {
+                    let abbrev = &name[..len];
+                    for spelling in [
+                        format!("--{abbrev}"),
+                        format!("\"--{abbrev}\""),
+                        format!("'--{abbrev}'"),
+                        format!("\\-\\-{abbrev}"),
+                        format!("--{abbrev}=x"),
+                    ] {
+                        assert_consumer_flag_blocks_rewrite(consumer.name, &spelling);
+                    }
+                }
+            }
+
+            for ch in consumer.unsafe_flag_chars {
+                for spelling in [
+                    format!("-{ch}"),
+                    format!("\"-{ch}\""),
+                    format!("'-{ch}'"),
+                    format!("\\-{ch}"),
+                    format!("-{ch}q"),
+                    format!("-q{ch}"),
+                    format!("-{ch}n20"),
+                ] {
+                    assert_consumer_flag_blocks_rewrite(consumer.name, &spelling);
+                }
+            }
+        }
+    }
+
+    /// Guards the test above against passing vacuously if the consumer table empties.
+    #[test]
+    fn test_safe_consumer_spellings_still_rewrite() {
+        for cmd in [
+            "git log | cat",
+            "git log | head -20",
+            "git log | tail -20",
+            "git log | tail -n 20",
+        ] {
+            assert!(
+                rewrite_command_no_prefixes(cmd, &[]).is_some(),
+                "{cmd} should rewrite"
+            );
+        }
+    }
+
     #[test]
     fn test_rewrite_pipe_following_tail_stays_raw() {
         for cmd in [
