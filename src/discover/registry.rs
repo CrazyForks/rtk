@@ -5,7 +5,10 @@ use regex::{Regex, RegexSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
-use super::lexer::{shell_split, split_on_operators, tokenize, ParsedToken, PipeKind, TokenKind};
+use super::lexer::{
+    redirect_has_file_target, shell_split, split_on_operators, tokenize, ParsedToken, PipeKind,
+    TokenKind,
+};
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
 const PHP_TOOL_NAMES: [&str; 6] = ["phpunit", "phpstan", "ecs", "pest", "paratest", "pint"];
@@ -628,7 +631,7 @@ fn analyze_pipeline(
     let mut has_supported_structure = true;
     let mut consumers_all_safe = true;
 
-    for token in tokens {
+    for (i, token) in tokens.iter().enumerate() {
         if token.offset >= end_offset {
             break;
         }
@@ -636,7 +639,9 @@ fn analyze_pipeline(
             continue;
         }
         if token.kind == TokenKind::Redirect {
-            consumers_all_safe = false;
+            if redirect_has_file_target(tokens, i) {
+                consumers_all_safe = false;
+            }
             continue;
         }
         let TokenKind::Pipe(kind) = token.kind else {
@@ -674,6 +679,20 @@ fn analyze_pipeline(
     }
 }
 
+fn rewrite_pipeline_stage(
+    cmd: &str,
+    stage_start: usize,
+    stage_end: usize,
+    context: RewriteContext,
+    excluded: &[ExcludePattern],
+    transparent_prefixes: &[String],
+) -> Option<String> {
+    let stage = cmd[stage_start..stage_end].trim();
+
+    rewrite_segment_inner(stage, excluded, transparent_prefixes, context, 0)
+        .filter(|rewritten| rewritten != stage)
+}
+
 fn rewrite_pipeline_final_stage(
     cmd: &str,
     segment_start: usize,
@@ -682,16 +701,15 @@ fn rewrite_pipeline_final_stage(
     transparent_prefixes: &[String],
 ) -> Option<String> {
     let final_stage_start = analysis.final_stage_start?;
-    let final_stage = cmd[final_stage_start..analysis.end_offset].trim();
 
-    rewrite_segment_inner(
-        final_stage,
+    rewrite_pipeline_stage(
+        cmd,
+        final_stage_start,
+        analysis.end_offset,
+        RewriteContext::PipelineFinal,
         excluded,
         transparent_prefixes,
-        RewriteContext::PipelineFinal,
-        0,
     )
-    .filter(|rewritten| rewritten != final_stage)
     .map(|rewritten| {
         format!(
             "{} {}",
@@ -713,16 +731,15 @@ fn rewrite_pipeline_producer(
     if !analysis.all_consumers_safe {
         return None;
     }
-    let producer = cmd[segment_start..first_pipe_offset].trim();
 
-    rewrite_segment_inner(
-        producer,
+    rewrite_pipeline_stage(
+        cmd,
+        segment_start,
+        first_pipe_offset,
+        RewriteContext::PipelineProducer,
         excluded,
         transparent_prefixes,
-        RewriteContext::PipelineProducer,
-        0,
     )
-    .filter(|rewritten| rewritten != producer)
     .map(|rewritten| {
         format!(
             "{} {}",
@@ -928,11 +945,12 @@ fn arg_matches_unsafe_flag(consumer: &SafePipeConsumer, arg: &str) -> bool {
 }
 
 fn is_safe_pipe_consumer(stage: &str) -> bool {
-    let mut words = stage.split_whitespace();
+    let words = shell_split(stage);
+    let mut words = words.iter();
     let Some(head) = words.next() else {
         return false;
     };
-    let Some(consumer) = SAFE_PIPE_CONSUMERS.iter().find(|c| c.name == head) else {
+    let Some(consumer) = SAFE_PIPE_CONSUMERS.iter().find(|c| c.name == head.as_str()) else {
         return false;
     };
     !words.any(|arg| arg_matches_unsafe_flag(consumer, arg))
@@ -1177,13 +1195,14 @@ fn rewrite_segment_inner(
     // Find the matching rule (rtk_cmd values are unique across all rules)
     let rule = RULES.iter().find(|r| r.rtk_cmd == rtk_equivalent)?;
     if context == RewriteContext::PipelineFinal
-        && (!rule.pipeline_final_safe || !pipeline_command_is_safe(rule.rtk_cmd, cmd_part))
+        && (!rule.pipeline_safety.final_safe() || !pipeline_command_is_safe(rule.rtk_cmd, cmd_part))
     {
         return None;
     }
     // #3171
     if context == RewriteContext::PipelineProducer
-        && (!rule.pipeline_producer_safe || !pipeline_command_is_safe(rule.rtk_cmd, cmd_part))
+        && (!rule.pipeline_safety.producer_safe()
+            || !pipeline_command_is_safe(rule.rtk_cmd, cmd_part))
     {
         return None;
     }
@@ -1343,7 +1362,7 @@ mod tests {
     fn test_pipeline_producer_safe_rule_set() {
         let mut safe_rules: Vec<_> = RULES
             .iter()
-            .filter(|rule| rule.pipeline_producer_safe)
+            .filter(|rule| rule.pipeline_safety.producer_safe())
             .map(|rule| rule.rtk_cmd)
             .collect();
         safe_rules.sort_unstable();
@@ -1413,7 +1432,7 @@ mod tests {
     fn test_pipeline_final_safe_rule_set() {
         let safe_rules: Vec<_> = RULES
             .iter()
-            .filter(|rule| rule.pipeline_final_safe)
+            .filter(|rule| rule.pipeline_safety.final_safe())
             .map(|rule| rule.rtk_cmd)
             .collect();
 
@@ -2282,6 +2301,18 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_pipe_consumer_fd_dup_redirect_rewritten() {
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | tail -5 2>&1", &[]),
+            Some("rtk git log | tail -5 2>&1".into())
+        );
+        assert_eq!(
+            rewrite_command_no_prefixes("git log | tail -5 2>/dev/null", &[]),
+            Some("rtk git log | tail -5 2>/dev/null".into())
+        );
+    }
+
+    #[test]
     fn test_rewrite_pipe_consumer_redirect_stays_raw() {
         assert_eq!(
             rewrite_command_no_prefixes("git log | tail -5 > out.txt", &[]),
@@ -2319,6 +2350,8 @@ mod tests {
             "git log | tail --foll",
             "git log | tail --f",
             "git log | tail -fn20",
+            "git log | tail \"-f\"",
+            "git log | tail \\-f",
         ] {
             assert_eq!(rewrite_command_no_prefixes(cmd, &[]), None, "{cmd}");
         }
