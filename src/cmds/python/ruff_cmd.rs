@@ -369,6 +369,28 @@ mod tests {
         }
     }
 
+    /// `known_ruff_subcommands_do_not_route_through_check` iterates the constant, so it
+    /// cannot catch an entry going missing. This pins the list against `ruff --help`.
+    #[test]
+    fn ruff_subcommands_cover_the_ruff_cli() {
+        assert_eq!(
+            RUFF_SUBCOMMANDS,
+            [
+                "analyze",
+                "check",
+                "clean",
+                "config",
+                "format",
+                "generate-shell-completion",
+                "help",
+                "linter",
+                "rule",
+                "server",
+                "version",
+            ]
+        );
+    }
+
     #[test]
     fn paths_and_explicit_check_route_through_check() {
         assert!(is_check_invocation(&[]));
