@@ -1461,9 +1461,13 @@ where
 }
 
 fn is_native_test_expression(command: &[String]) -> bool {
-    command
-        .first()
-        .is_some_and(|arg| arg == "!" || arg == "(" || arg.starts_with('-'))
+    match command.first().map(String::as_str) {
+        // `!` and `(` are shell syntax too, so they only mark a native
+        // expression when what they apply to is one.
+        Some("!") | Some("(") => is_native_test_expression(&command[1..]),
+        Some(arg) => arg.starts_with('-'),
+        None => false,
+    }
 }
 
 fn run_cli() -> Result<i32> {
@@ -2866,6 +2870,18 @@ mod tests {
     #[test]
     fn test_dash_d_routes_to_native_test_expression() {
         let command = vec!["-d".to_string(), "graphify-out".to_string()];
+        assert!(is_native_test_expression(&command));
+    }
+
+    #[test]
+    fn test_bang_before_command_is_not_a_native_expression() {
+        let command = vec!["!".to_string(), "false".to_string()];
+        assert!(!is_native_test_expression(&command));
+    }
+
+    #[test]
+    fn test_bang_before_operator_is_a_native_expression() {
+        let command = vec!["!".to_string(), "-d".to_string(), "dir".to_string()];
         assert!(is_native_test_expression(&command));
     }
 
